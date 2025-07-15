@@ -1,0 +1,231 @@
+// tracking_no_encoder.cpp
+#include <Eigen/Dense>
+#include <opencv2/opencv.hpp>
+#include <chrono>
+#include <thread>
+#include <mutex>
+#include <atomic>
+#include <iostream>
+
+using namespace Eigen;
+using Clock = std::chrono::steady_clock;
+
+// --------- KALMAN FILTER (relative angle) ---------
+class KalmanFilter {
+public:
+    // q_base: process noise, r_radar/r_vision: measurement noise
+    KalmanFilter(double q_base, double r_radar, double r_vision)
+      : Q_base(Matrix4d::Identity()*q_base),
+        R_radar(Matrix2d::Identity()*r_radar),
+        R_vision(Matrix2d::Identity()*r_vision)
+    {
+        x.setZero();
+        P = Matrix4d::Identity()*0.1;
+        H << 1,0, 0,0,
+             0,0, 1,0;
+        last_update = Clock::now();
+    }
+
+    // Predict Δt (s)
+    void predict(double dt) {
+        Matrix4d F = Matrix4d::Identity();
+        F(0,1)=dt;  F(2,3)=dt;
+        x = F*x;
+        P = F*P*F.transpose() + Q_base*dt;
+    }
+
+    // Update with z=(rel_pan,rel_tilt), dt_meas, sensor_type 0=radar/1=vision
+    void update(const Vector2d& z, double dt_meas, int sensor_type) {
+        double alpha = std::min(1.0, dt_meas);
+        // adapt Q
+        P += Q_base*dt_meas;
+        // choose R
+        const Matrix2d& R = (sensor_type==0 ? R_radar : R_vision)*alpha;
+        // Kalman gain
+        Matrix2d S = H*P*H.transpose() + R;
+        Matrix<double,4,2> K = P*H.transpose()*S.inverse();
+        // update
+        x = x + K*(z - H*x);
+        P = (Matrix4d::Identity() - K*H)*P;
+        last_update = Clock::now();
+    }
+
+    // return (rel_pan, rel_tilt)
+    Vector2d angles() const { return Vector2d(x(0), x(2)); }
+
+    Clock::time_point last_update;
+
+private:
+    Vector4d x;
+    Matrix4d P, Q_base;
+    Matrix2d R_radar, R_vision;
+    Matrix<double,2,4> H;
+};
+
+// --------- PID CONTROLLER ---------
+class PID {
+public:
+    PID(double Kp, double Ki, double Kd)
+      : Kp(Kp), Ki(Ki), Kd(Kd), integral(0), prev_err(0) {}
+
+    double update(double err, double dt) {
+        if(dt>1.0) integral = 0;          // wind-up guard
+        integral += err*dt;
+        double deriv = dt>0 ? (err-prev_err)/dt : 0;
+        prev_err = err;
+        return Kp*err + Ki*integral + Kd*deriv;
+    }
+
+    void reset() { integral=prev_err=0; }
+
+private:
+    double Kp,Ki,Kd, integral, prev_err;
+};
+
+// --------- STUBS I/O ---------
+// Radar trả relative angles (rad), hoặc false nếu không đo được
+bool getRadarMeasurement(double& rel_pan, double& rel_tilt) {
+    return false; 
+}
+// Mỗi chu kỳ control ta chỉ dùng Kalman & vision, không cần encoder
+void sendServo(double u_pan, double u_tilt) {
+    // TODO: thực thi lệnh pan/tilt
+}
+
+// --------- VISION TRACKER (offset pixel) ---------
+class VisionTracker {
+public:
+    VisionTracker(int w, int h, double fov_x, double fov_y)
+      : img_w(w), img_h(h)
+    {
+        ang_per_px_x = fov_x/ w;
+        ang_per_px_y = fov_y/ h;
+        tracker = cv::TrackerMOSSE::create();
+    }
+    void init(const cv::Mat& frame, const cv::Rect2d& roi){
+        tracker->init(frame, roi);
+    }
+    // Cập nhật, trả true nếu thành công
+    bool update(const cv::Mat& frame) {
+        if(!tracker->update(frame, bbox)) return false;
+        double cx = bbox.x + bbox.width/2;
+        double cy = bbox.y + bbox.height/2;
+        // pixel offset → angle offset
+        rel_pan  = (cx - img_w/2)*ang_per_px_x;
+        rel_tilt = (cy - img_h/2)*ang_per_px_y;
+        return true;
+    }
+    Vector2d getRelAngles() const {
+        return Vector2d(rel_pan, rel_tilt);
+    }
+private:
+    int img_w, img_h;
+    double ang_per_px_x, ang_per_px_y;
+    double rel_pan=0, rel_tilt=0;
+    cv::Ptr<cv::Tracker> tracker;
+    cv::Rect2d bbox;
+};
+
+// --------- MAIN ---------
+int main(){
+    // Thông số
+    const double Q_base=0.01,
+                 R_radar=0.05, R_vision=0.2,
+                 Kp=1.5, Ki=0.5, Kd=0.05;
+    const double ctrl_dt = 1.0/30.0;   // 30 Hz
+
+    // Init
+    KalmanFilter kf(Q_base, R_radar, R_vision);
+    PID pidPan(Kp,Ki,Kd), pidTilt(Kp,Ki,Kd);
+
+    // Vision: ví dụ camera 640×480, FOV 60°×45°
+    VisionTracker vision(640, 480, 60*M_PI/180, 45*M_PI/180);
+    // TODO: gọi vision.init(...) sau khi biết ROI
+
+    // Dữ liệu chia sẻ
+    std::mutex mtx;
+    Vector2d radar_z;  bool new_rad=false;
+    Vector2d vis_z;    bool new_vis=false;
+    std::atomic<bool> running{true};
+
+    // Radar thread
+    std::thread tr([&](){
+        while(running){
+            double rp, rt;
+            if(getRadarMeasurement(rp,rt)){
+                std::lock_guard<std::mutex> lk(mtx);
+                radar_z = Vector2d(rp, rt);
+                new_rad = true;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        }
+    });
+
+    // Vision thread
+    std::thread tv([&](){
+        cv::VideoCapture cap(0);
+        cv::Mat frame;
+        while(running && cap.isOpened()){
+            cap >> frame;
+            if(frame.empty()) break;
+            if(vision.update(frame)){
+                std::lock_guard<std::mutex> lk(mtx);
+                vis_z = vision.getRelAngles();
+                new_vis = true;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+    });
+
+    // Control loop 30 Hz
+    auto t_last = Clock::now();
+    while(running){
+        auto t_now = Clock::now();
+        double dt = std::chrono::duration<double>(t_now - t_last).count();
+        if(dt < ctrl_dt) {
+            std::this_thread::sleep_for(
+              std::chrono::duration<double>(ctrl_dt - dt));
+            continue;
+        }
+        t_last = Clock::now();
+
+        // 1) Predict
+        kf.predict(dt);
+
+        // 2) Vision update
+        {
+            std::lock_guard<std::mutex> lk(mtx);
+            if(new_vis){
+                double dtm = std::chrono::duration<double>(
+                  Clock::now() - kf.last_update).count();
+                kf.update(vis_z, dtm, /*vision*/1);
+                new_vis = false;
+            }
+        }
+
+        // 3) Radar update
+        {
+            std::lock_guard<std::mutex> lk(mtx);
+            if(new_rad){
+                double dtm = std::chrono::duration<double>(
+                  Clock::now() - kf.last_update).count();
+                if(dtm < 2.0) 
+                    kf.update(radar_z, dtm, /*radar*/0);
+                new_rad = false;
+                pidPan.reset();
+                pidTilt.reset();
+            }
+        }
+
+        // 4) PID on relative angles
+        Vector2d rel = kf.angles();  // [pan_offset, tilt_offset]
+        double u_pan  = pidPan.update(-rel.x(), dt);
+        double u_tilt = pidTilt.update(-rel.y(), dt);
+        sendServo(u_pan, u_tilt);
+    }
+
+    // cleanup
+    running = false;
+    tr.join(); tv.join();
+    return 0;
+}
