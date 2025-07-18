@@ -1,0 +1,108 @@
+// PanTiltTracker.h
+#pragma once
+
+#include <QObject>
+#include <QThread>
+#include <QVector3D>
+#include <QMutex>
+#include <atomic>
+#include <cmath>
+#include <Eigen/Dense>
+
+class PanTiltTracker : public QThread {
+    Q_OBJECT
+
+public:
+    explicit PanTiltTracker(double kpPan, double kpTilt, QObject *parent = nullptr)
+      : QThread(parent)
+      , KpPan_(kpPan)
+      , KpTilt_(kpTilt)
+      , runFlag_(false)
+    {}
+
+    ~PanTiltTracker() override {
+        stopTracking();
+    }
+
+    // Bắt đầu vòng điều khiển 30 Hz
+    void startTracking() {
+        if (!runFlag_) {
+            runFlag_ = true;
+            QThread::start();  // gọi run() trên thread mới
+        }
+    }
+
+    // Dừng vòng điều khiển
+    void stopTracking() {
+        if (runFlag_) {
+            runFlag_ = false;
+            wait();            // đợi thread kết thúc
+        }
+    }
+
+public slots:
+    // Gọi khi có đo radar mới
+    void setRadarMeasurement(const QVector3D &pos) {
+        QMutexLocker locker(&mutex_);
+        kalman_.update(Eigen::Vector3d(pos.x(), pos.y(), pos.z()));
+    }
+
+signals:
+    // Phát ra lệnh pan/tilt (rad)
+    void panTiltCommand(double pan, double tilt);
+
+protected:
+    // Vòng lặp điều khiển chạy trên thread riêng
+    void run() override {
+        const double dt = 1.0 / 30.0;  // 30 Hz
+        while (runFlag_) {
+            {
+                QMutexLocker locker(&mutex_);
+                kalman_.predict(dt);
+                auto st = kalman_.getState().x;
+                double pan  = std::atan2(st(0), st(2));
+                double tilt = std::atan2(st(1), st(2));
+                emit panTiltCommand(KpPan_ * pan, KpTilt_ * tilt);
+            }
+            QThread::msleep(static_cast<unsigned long>(dt * 1000));
+        }
+    }
+
+private:
+    // Bộ lọc Kalman nội bộ
+    struct KalmanTracker {
+        Eigen::VectorXd x;      // [x y z vx vy vz]
+        Eigen::MatrixXd P, Q, R, H;
+
+        KalmanTracker() {
+            x = Eigen::VectorXd::Zero(6);
+            P = Eigen::MatrixXd::Identity(6,6) * 1e3;
+            Q = Eigen::MatrixXd::Identity(6,6) * 0.01;
+            R = Eigen::Matrix3d::Identity() * 0.1;
+            H = Eigen::MatrixXd::Zero(3,6);
+            H.block<3,3>(0,0) = Eigen::Matrix3d::Identity();
+        }
+
+        void predict(double dt) {
+            Eigen::MatrixXd F = Eigen::MatrixXd::Identity(6,6);
+            F.block<3,3>(0,3) = Eigen::Matrix3d::Identity() * dt;
+            x = F * x;
+            P = F * P * F.transpose() + Q;
+        }
+
+        void update(const Eigen::Vector3d &z) {
+            Eigen::Vector3d y = z - H * x;
+            Eigen::MatrixXd S = H * P * H.transpose() + R;
+            Eigen::MatrixXd K = P * H.transpose() * S.inverse();
+            x += K * y;
+            P = (Eigen::MatrixXd::Identity(6,6) - K * H) * P;
+        }
+
+        struct State { Eigen::VectorXd x; Eigen::MatrixXd P; };
+        State getState() const { return { x, P }; }
+    } kalman_;
+
+    QMutex              mutex_;
+    std::atomic<bool>   runFlag_;
+    double              KpPan_, KpTilt_;
+};
