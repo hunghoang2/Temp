@@ -1,0 +1,12 @@
+#!/bin/sh
+# Thiết lập 4 virtual screens
+xrandr --newmode "1920x1080_60.00" 173.00 1920 2048 2248 2576 1080 1083 1088 1120 -hsync +vsync
+for V in Virtual1 Virtual2 Virtual3 Virtual4; do
+  xrandr --addmode $V "1920x1080_60.00"
+done
+
+xrandr \
+  --output Virtual1 --mode 1920x1080 --pos   0x0 \
+  --output Virtual2 --mode 1920x1080 --pos1920x0 \
+  --output Virtual3 --mode 1920x1080 --pos3840x0 \
+  --output Virtual4 --mode 1920x1080 --pos5760x0
