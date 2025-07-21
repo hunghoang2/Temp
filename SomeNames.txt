@@ -1,13 +1,12 @@
 #!/bin/sh
-# Tạo mode 1920×1080 nếu cần
-xrandr --newmode "1920x1080_60.00" \
-       173.00 1920 2048 2248 2576 1080 1083 1088 1120 -hsync +vsync
+# (1) Sinh và thêm mode (bỏ nếu dùng autofit)
+cvt 1920 1080 60 | grep Modeline | \
+  sed 's/Modeline //' | xargs xrandr --newmode
+for V in Virtual1 Virtual2; do
+  xrandr --addmode $V 1920x1080_60.00
+done
 
-# Thêm mode cho 2 màn
-xrandr --addmode Virtual1 "1920x1080_60.00"
-xrandr --addmode Virtual2 "1920x1080_60.00"
-
-# Bật 2 màn và xếp cạnh nhau
+# (2) Bật và xếp
 xrandr \
-  --output Virtual1 --mode 1920x1080 --pos   0x0 --primary \
-  --output Virtual2 --mode 1920x1080 --pos1920x0
+  --output Virtual1 --mode 1920x1080_60.00 --pos   0x0 --primary \
+  --output Virtual2 --mode 1920x1080_60.00 --pos1920x0
