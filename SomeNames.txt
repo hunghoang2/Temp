@@ -1,12 +1,6 @@
 #!/bin/sh
-# (1) Sinh và thêm mode (bỏ nếu dùng autofit)
-cvt 1920 1080 60 | grep Modeline | \
-  sed 's/Modeline //' | xargs xrandr --newmode
-for V in Virtual1 Virtual2; do
-  xrandr --addmode $V 1920x1080_60.00
-done
-
-# (2) Bật và xếp
+# Nếu dùng autofit, bỏ qua cvt/newmode/addmode
+# Chỉ phần enable và pos:
 xrandr \
-  --output Virtual1 --mode 1920x1080_60.00 --pos   0x0 --primary \
-  --output Virtual2 --mode 1920x1080_60.00 --pos1920x0
+  --output Virtual1 --mode vmw-autofit-1920x1080-Virtual1 --pos0x0 --primary \
+  --output Virtual2 --mode vmw-autofit-1920x1080-Virtual2 --pos1920x0
