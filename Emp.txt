@@ -1,118 +1,51 @@
-// tracking_qt_control.cpp // Qt C++ implementation of asynchronous Kalman+PID tracking with external control signals // Uses QTimer, OpenCV and Eigen; radar/vision threads call setRadarData()/setVisionData()
+Section "ServerLayout"
+    Identifier     "DualHeadLayout"
+    Screen         0 "Screen0" 0 0
+    Screen         1 "Screen1" RightOf "Screen0"
+EndSection
 
-#include <QCoreApplication> #include <QObject> #include <QTimer> #include <QMutex> #include <QDateTime> #include <opencv2/opencv.hpp> #include <Eigen/Dense> #include <atomic>
+Section "Monitor"
+    Identifier     "Monitor0"
+    Option         "PreferredMode" "1920x1080"
+EndSection
 
-using namespace Eigen; using Timestamp = qint64;  // ms since epoch
+Section "Monitor"
+    Identifier     "Monitor1"
+    Option         "PreferredMode" "1920x1080"
+EndSection
 
-// --------- KalmanFilter --------- class KalmanFilter { public: KalmanFilter(double q_base, double r_radar, double r_vision) : Q_base(Matrix4d::Identity()*q_base), R_radar(Matrix2d::Identity()*r_radar), R_vision(Matrix2d::Identity()*r_vision) { x.setZero(); P = Matrix4d::Identity()*0.1; H << 1,0, 0,0, 0,0, 1,0; lastUpdate = QDateTime::currentMSecsSinceEpoch(); }
+Section "Device"
+    Identifier     "Device0"
+    Driver         "vmwgfx"
+    # Nếu bạn biết đúng BusID, có thể thêm:
+    # BusID         "PCI:0:3:0"
+    Screen         0
+EndSection
 
-void predict(double dt) {
-    Matrix4d F = Matrix4d::Identity();
-    F(0,1)=dt; F(2,3)=dt;
-    x = F*x;
-    P = F*P*F.transpose() + Q_base*dt;
-}
+Section "Device"
+    Identifier     "Device1"
+    Driver         "vmwgfx"
+    Screen         1
+EndSection
 
-void update(const Vector2d &z, double dt, bool isRadar) {
-    double alpha = qMin(1.0, dt);
-    P += Q_base*dt;
-    const Matrix2d &R = (isRadar ? R_radar : R_vision)*alpha;
-    Matrix2d S = H*P*H.transpose() + R;
-    Matrix<double,4,2> K = P*H.transpose()*S.inverse();
-    x += K*(z - H*x);
-    P = (Matrix4d::Identity() - K*H)*P;
-    lastUpdate = QDateTime::currentMSecsSinceEpoch();
-}
+Section "Screen"
+    Identifier     "Screen0"
+    Device         "Device0"
+    Monitor        "Monitor0"
+    DefaultDepth    24
+    SubSection "Display"
+        Depth       24
+        Modes      "1920x1080"
+    EndSubSection
+EndSection
 
-Vector2d angles() const { return Vector2d(x(0), x(2)); }
-Timestamp lastUpdate;
-
-private: Vector4d x; Matrix4d P; const Matrix4d Q_base; const Matrix2d R_radar, R_vision; Matrix<double,2,4> H; };
-
-// --------- PID Controller --------- class PID { public: PID(double p, double i, double d) : Kp(p), Ki(i), Kd(d), integral(0), prevErr(0) {}
-
-double update(double err, double dt) {
-    if (dt > 1.0) integral = 0;
-    integral += err*dt;
-    double deriv = dt>0 ? (err-prevErr)/dt : 0;
-    prevErr = err;
-    return Kp*err + Ki*integral + Kd*deriv;
-}
-
-void reset() { integral=prevErr=0; }
-
-private: double Kp, Ki, Kd, integral, prevErr; };
-
-// --------- Tracking Controller --------- class TrackingController : public QObject { Q_OBJECT public: TrackingController(QObject *parent=nullptr) : QObject(parent), kf(0.01, 0.05, 0.2), pidPan(1.5, 0.5, 0.05), pidTilt(1.5, 0.5, 0.05), timer(new QTimer(this)) { timer->setInterval(33); // ~30 Hz connect(timer, &QTimer::timeout, this, &TrackingController::controlLoop); }
-
-public slots: // External control signal void startControl() { timer->start(); } void stopControl()  { timer->stop(); }
-
-// Called by external radar thread
-void setRadarData(double relPan, double relTilt, Timestamp ts) {
-    QMutexLocker lk(&mtx);
-    radarZ = Vector2d(relPan, relTilt);
-    radarTs = ts;
-    newRadar = true;
-}
-// Called by external vision thread
-void setVisionData(double relPan, double relTilt, Timestamp ts) {
-    QMutexLocker lk(&mtx);
-    visionZ = Vector2d(relPan, relTilt);
-    visionTs = ts;
-    newVision = true;
-}
-
-private slots: void controlLoop() { const double dt = 0.033; // fixed interval kf.predict(dt);
-
-// Vision update (24 Hz) if available
-    {
-        QMutexLocker lk(&mtx);
-        if (newVision) {
-            double dtv = (visionTs - kf.lastUpdate)/1000.0;
-            kf.update(visionZ, dtv, false);
-            newVision = false;
-        }
-    }
-
-    // Radar update (0.7–1.2s) if available
-    {
-        QMutexLocker lk(&mtx);
-        if (newRadar) {
-            double dtr = (radarTs - kf.lastUpdate)/1000.0;
-            if (dtr < 2.0) kf.update(radarZ, dtr, true);
-            newRadar = false;
-            pidPan.reset(); pidTilt.reset();
-        }
-    }
-
-    // PID on relative angles
-    Vector2d rel = kf.angles();
-    double uPan  = pidPan.update(-rel.x(), dt);
-    double uTilt = pidTilt.update(-rel.y(), dt);
-    sendServo(uPan, uTilt);
-}
-
-private: KalmanFilter kf; PID pidPan, pidTilt; QTimer *timer; QMutex mtx; Vector2d radarZ, visionZ; Timestamp radarTs=0, visionTs=0; bool newRadar=false, newVision=false; };
-
-// --------- Stub for servo command --------- void sendServo(double panCmd, double tiltCmd) { // TODO: implement servo actuation }
-
-// --------- main --------- int main(int argc, char *argv[]) { QCoreApplication app(argc, argv);
-
-TrackingController controller;
-
-// Example: external signal to start/stop
-// QObject::connect(someSignalSource, &SignalSource::started,
-//                  &controller, &TrackingController::startControl);
-// QObject::connect(someSignalSource, &SignalSource::stopped,
-//                  &controller, &TrackingController::stopControl);
-
-// Example: radar/vision threads should call:
-// controller.setRadarData(pan, tilt, QDateTime::currentMSecsSinceEpoch());
-// controller.setVisionData(pan, tilt, QDateTime::currentMSecsSinceEpoch());
-
-return app.exec();
-
-}
-
-#include "tracking_qt_control.moc"
-
+Section "Screen"
+    Identifier     "Screen1"
+    Device         "Device1"
+    Monitor        "Monitor1"
+    DefaultDepth    24
+    SubSection "Display"
+        Depth       24
+        Modes      "1920x1080"
+    EndSubSection
+EndSection
