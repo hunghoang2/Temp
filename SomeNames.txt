@@ -1,6 +1,30 @@
-#!/bin/sh
-# Nếu dùng autofit, bỏ qua cvt/newmode/addmode
-# Chỉ phần enable và pos:
-xrandr \
-  --output Virtual1 --mode vmw-autofit-1920x1080-Virtual1 --pos0x0 --primary \
-  --output Virtual2 --mode vmw-autofit-1920x1080-Virtual2 --pos1920x0
+#!/bin/bash
+
+# Danh sách các gói cần download dependency
+PACKAGE_LIST="gstreamer1.0-tools gstreamer1.0-libav gstreamer1.0-plugins-good gstreamer1.0-plugins-base gstreamer1.0-plugins-bad"
+
+# Thư mục lưu file deb
+OUTDIR="deb_pkgs_gstreamer_full"
+mkdir -p "$OUTDIR"
+
+echo "Lấy danh sách full dependencies cho các gói:"
+echo "$PACKAGE_LIST"
+
+# Gộp toàn bộ dependency lại, loại trùng, chỉ lấy package hợp lệ
+rm -f deps-valid.txt
+for PKG in $PACKAGE_LIST; do
+    apt-rdepends "$PKG" 2>/dev/null | grep -v "^ " | grep -v "^Reverse Depends:" 
+done | sort -u | while read pkg; do
+    if apt-cache show "$pkg" >/dev/null 2>&1; then
+        echo "$pkg"
+    fi
+done | sort -u > deps-valid.txt
+
+echo "Danh sách gói hợp lệ cần download:"
+cat deps-valid.txt
+
+echo "Bắt đầu download file .deb về thư mục $OUTDIR ..."
+cd "$OUTDIR"
+xargs apt-get download < ../deps-valid.txt
+
+echo "Hoàn thành! Tất cả .deb đã nằm trong $OUTDIR"
