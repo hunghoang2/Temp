@@ -1,30 +1,7 @@
-#!/bin/bash
-
-# Danh sách các gói cần download dependency
-PACKAGE_LIST="gstreamer1.0-tools gstreamer1.0-libav gstreamer1.0-plugins-good gstreamer1.0-plugins-base gstreamer1.0-plugins-bad"
-
-# Thư mục lưu file deb
-OUTDIR="deb_pkgs_gstreamer_full"
-mkdir -p "$OUTDIR"
-
-echo "Lấy danh sách full dependencies cho các gói:"
-echo "$PACKAGE_LIST"
-
-# Gộp toàn bộ dependency lại, loại trùng, chỉ lấy package hợp lệ
-rm -f deps-valid.txt
-for PKG in $PACKAGE_LIST; do
-    apt-rdepends "$PKG" 2>/dev/null | grep -v "^ " | grep -v "^Reverse Depends:" 
-done | sort -u | while read pkg; do
-    if apt-cache show "$pkg" >/dev/null 2>&1; then
-        echo "$pkg"
-    fi
-done | sort -u > deps-valid.txt
-
-echo "Danh sách gói hợp lệ cần download:"
-cat deps-valid.txt
-
-echo "Bắt đầu download file .deb về thư mục $OUTDIR ..."
-cd "$OUTDIR"
-xargs apt-get download < ../deps-valid.txt
-
-echo "Hoàn thành! Tất cả .deb đã nằm trong $OUTDIR"
+gst-launch-1.0 -v \
+  v4l2src device=/dev/video0 do-timestamp=true io-mode=2 ! \
+  image/jpeg,width=640,height=480,framerate=25/1 ! \
+  queue max-size-buffers=1 leaky=downstream ! \
+  rtpjpegpay pt=26 ! rtpstreampay ! \
+  queue max-size-buffers=1 leaky=downstream ! \
+  tcpserversink host=0.0.0.0 port=5000
