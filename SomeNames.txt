@@ -27,6 +27,13 @@ gst-launch-1.0 -v \
 
 
 gst-launch-1.0 -v \
+  v4l2src device=/dev/video0 io-mode=2 do-timestamp=true \
+    extra-controls="c,exposure_auto=1,exposure_auto_priority=0,exposure_absolute=5,power_line_frequency=1" ! \
+  image/jpeg,width=640,height=480,framerate=25/1 ! \
+  queue max-size-buffers=1 leaky=downstream ! \
+  jpegdec ! videoconvert ! fpsdisplaysink text-overlay=false sync=false
+
+gst-launch-1.0 -v \
   v4l2src device=/dev/video0 do-timestamp=true io-mode=2 ! \
 image/jpeg,width=640,height=480,framerate=25/1 ! \
   jpegdec ! videoconvert ! \
