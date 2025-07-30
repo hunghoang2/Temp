@@ -1,51 +1,60 @@
-Section "ServerLayout"
-    Identifier     "DualHeadLayout"
-    Screen         0 "Screen0" 0 0
-    Screen         1 "Screen1" RightOf "Screen0"
-EndSection
+// main.cpp
+#include <QCoreApplication>
+#include <QTcpServer>
+#include <QTcpSocket>
+#include <QDebug>
+#include <QJsonDocument>
+#include <QJsonObject>
 
-Section "Monitor"
-    Identifier     "Monitor0"
-    Option         "PreferredMode" "1920x1080"
-EndSection
+class SimpleHttpServer : public QTcpServer
+{
+    Q_OBJECT
+public:
+    SimpleHttpServer(QObject *parent = nullptr) : QTcpServer(parent) {
+        connect(this, &QTcpServer::newConnection, this, &SimpleHttpServer::onNewConnection);
+    }
 
-Section "Monitor"
-    Identifier     "Monitor1"
-    Option         "PreferredMode" "1920x1080"
-EndSection
+private slots:
+    void onNewConnection() {
+        QTcpSocket *client = nextPendingConnection();
+        connect(client, &QTcpSocket::readyRead, [this, client]() {
+            QByteArray data = client->readAll();
+            qDebug() << "Recv data:" << data;
 
-Section "Device"
-    Identifier     "Device0"
-    Driver         "vmwgfx"
-    # Nếu bạn biết đúng BusID, có thể thêm:
-    # BusID         "PCI:0:3:0"
-    Screen         0
-EndSection
+            // Rất thô sơ, chỉ demo POST /api/data
+            if (data.startsWith("POST /api/data")) {
+                int jsonPos = data.indexOf("\r\n\r\n");
+                if (jsonPos > 0) {
+                    QByteArray jsonData = data.mid(jsonPos + 4);
+                    QJsonParseError err;
+                    QJsonDocument doc = QJsonDocument::fromJson(jsonData, &err);
+                    if (err.error == QJsonParseError::NoError) {
+                        qDebug() << "JSON nhận được:" << doc.object();
+                        // Response JSON OK
+                        QJsonObject resp { {"status", "ok"}, {"received", doc.object()} };
+                        QByteArray respBody = QJsonDocument(resp).toJson();
+                        QString header = QString(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: %1\r\n\r\n"
+                        ).arg(respBody.size());
+                        client->write(header.toUtf8() + respBody);
+                        client->disconnectFromHost();
+                    }
+                }
+            }
+        });
+    }
+};
 
-Section "Device"
-    Identifier     "Device1"
-    Driver         "vmwgfx"
-    Screen         1
-EndSection
+#include "main.moc"
 
-Section "Screen"
-    Identifier     "Screen0"
-    Device         "Device0"
-    Monitor        "Monitor0"
-    DefaultDepth    24
-    SubSection "Display"
-        Depth       24
-        Modes      "1920x1080"
-    EndSubSection
-EndSection
-
-Section "Screen"
-    Identifier     "Screen1"
-    Device         "Device1"
-    Monitor        "Monitor1"
-    DefaultDepth    24
-    SubSection "Display"
-        Depth       24
-        Modes      "1920x1080"
-    EndSubSection
-EndSection
+int main(int argc, char *argv[])
+{
+    QCoreApplication a(argc, argv);
+    SimpleHttpServer server;
+    if (!server.listen(QHostAddress::Any, 8080)) {
+        qDebug() << "Không thể mở cổng 8080";
+        return 1;
+    }
+    qDebug() << "Server chạy cổng 8080";
+    return a.exec();
+}
