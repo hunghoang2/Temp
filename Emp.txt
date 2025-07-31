@@ -1,60 +1,50 @@
-// main.cpp
-#include <QCoreApplication>
-#include <QTcpServer>
-#include <QTcpSocket>
-#include <QDebug>
-#include <QJsonDocument>
-#include <QJsonObject>
+#include <iostream>
+#include <fstream>
+#include <sstream>
+#include <regex>
 
-class SimpleHttpServer : public QTcpServer
-{
-    Q_OBJECT
-public:
-    SimpleHttpServer(QObject *parent = nullptr) : QTcpServer(parent) {
-        connect(this, &QTcpServer::newConnection, this, &SimpleHttpServer::onNewConnection);
+void overwriteLocationText(const std::string& filename,
+                          double latitude,
+                          double longitude,
+                          double altitude) {
+    std::ifstream in(filename);
+    if (!in.is_open()) {
+        std::cerr << "Không mở được file " << filename << "\n";
+        return;
     }
+    std::stringstream buffer;
+    buffer << in.rdbuf();
+    std::string content = buffer.str();
+    in.close();
 
-private slots:
-    void onNewConnection() {
-        QTcpSocket *client = nextPendingConnection();
-        connect(client, &QTcpSocket::readyRead, [this, client]() {
-            QByteArray data = client->readAll();
-            qDebug() << "Recv data:" << data;
+    // Regex tìm block "Location": { ... }
+    std::regex locationRegex(R"("Location"\s*:\s*\{[^}]*\})");
 
-            // Rất thô sơ, chỉ demo POST /api/data
-            if (data.startsWith("POST /api/data")) {
-                int jsonPos = data.indexOf("\r\n\r\n");
-                if (jsonPos > 0) {
-                    QByteArray jsonData = data.mid(jsonPos + 4);
-                    QJsonParseError err;
-                    QJsonDocument doc = QJsonDocument::fromJson(jsonData, &err);
-                    if (err.error == QJsonParseError::NoError) {
-                        qDebug() << "JSON nhận được:" << doc.object();
-                        // Response JSON OK
-                        QJsonObject resp { {"status", "ok"}, {"received", doc.object()} };
-                        QByteArray respBody = QJsonDocument(resp).toJson();
-                        QString header = QString(
-                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: %1\r\n\r\n"
-                        ).arg(respBody.size());
-                        client->write(header.toUtf8() + respBody);
-                        client->disconnectFromHost();
-                    }
-                }
-            }
-        });
+    // Tạo block Location mới
+    std::ostringstream oss;
+    oss << "\"Location\": {\n"
+        << "        \"latitude\": " << latitude << ",\n"
+        << "        \"longitude\": " << longitude << ",\n"
+        << "        \"altitude\": " << altitude << "\n"
+        << "    }";
+
+    // Thay thế block Location cũ bằng mới
+    std::string replaced = std::regex_replace(content, locationRegex, oss.str());
+
+    // Ghi lại file
+    std::ofstream out(filename);
+    if (!out.is_open()) {
+        std::cerr << "Không ghi được file " << filename << "\n";
+        return;
     }
-};
+    out << replaced;
+    out.close();
 
-#include "main.moc"
+    std::cout << "Đã cập nhật Location, giữ nguyên thứ tự trường!\n";
+}
 
-int main(int argc, char *argv[])
-{
-    QCoreApplication a(argc, argv);
-    SimpleHttpServer server;
-    if (!server.listen(QHostAddress::Any, 8080)) {
-        qDebug() << "Không thể mở cổng 8080";
-        return 1;
-    }
-    qDebug() << "Server chạy cổng 8080";
-    return a.exec();
+int main() {
+    // Ví dụ gọi hàm:
+    overwriteLocationText("app.json", 105.888, 21.333, 11.0);
+    return 0;
 }
