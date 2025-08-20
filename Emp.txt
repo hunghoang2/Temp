@@ -1,361 +1,45 @@
 #include <modbus/modbus.h>
-#include <iostream>
-#include <iomanip>
 #include <string>
 #include <vector>
-#include <csignal>
-#include <chrono>
-#include <thread>
-#include <cstdint>
-#include <cstring>
+#include <iostream>
 
-static volatile bool g_running = true;
-void handle_sigint(int) { g_running = false; }
+bool write_string(modbus_t* ctx, int start_addr, const std::string& str, size_t max_chars)
+{
+    // copy và zero terminate
+    std::string buf = str.substr(0, max_chars-1);
+    buf.push_back('\0');
 
-/* ====== CONFIG (sửa theo hệ thống của bạn) ====== */
-static const char* MODBUS_HOST = "192.168.0.50";
-static const int   MODBUS_PORT = 502;
-static const int   MODBUS_UNIT_ID = 1;
+    // pad cho chẵn số byte
+    if (buf.size() % 2 != 0) buf.push_back('\0');
 
-/* Template register map (0-based) — CHỈ LÀ MẪU, SỬA THEO VENDOR MAP */
-namespace REG {
-    // Identification / System info
-    constexpr int MODEL_ID        = 0x0000; // u16
-    constexpr int HW_REV          = 0x0001; // u16
-    constexpr int FW_MAJOR        = 0x0002; // u16
-    constexpr int FW_MINOR        = 0x0003; // u16
-    constexpr int SERIAL_HI       = 0x0004; // u32 (0x0004..0x0005)
-    constexpr int UPTIME_HI       = 0x0008; // u32 (0x0008..0x0009)
+    size_t reg_count = buf.size() / 2;
+    std::vector<uint16_t> regs(reg_count);
 
-    // Status / Interlocks
-    constexpr int STATUS_BITS     = 0x0010; // u16 (b0 Ready, b1 HV On, b2 Pulsing, b3 Warmup, b4 Remote, b5 LocalLock)
-    constexpr int INTERLOCK_BITS  = 0x0011; // u16
-    constexpr int ALARM_CODE      = 0x0012; // u16
-    constexpr int LAST_FAULT      = 0x0013; // u16
-    constexpr int INTERNAL_TEMP   = 0x0014; // i16 (°C x10)
-
-    // Setpoints (Holding)
-    constexpr int HV_SET          = 0x0020; // u16 (kV x100)
-    constexpr int PULSE_I_SET     = 0x0021; // u16 (A x1000)
-    constexpr int PRF_SET         = 0x0022; // u16 (Hz)
-    constexpr int PW_SET          = 0x0023; // u16 (us)
-    constexpr int FILAMENT_I_SET  = 0x0024; // u16 (A x1000)
-
-    // Readbacks (Input/Holding)
-    constexpr int HV_ACT          = 0x0030; // u16 (kV x100)
-    constexpr int PULSE_I_ACT     = 0x0031; // u16 (A x1000)
-    constexpr int PRF_ACT         = 0x0032; // u16 (Hz)
-    constexpr int PW_ACT          = 0x0033; // u16 (us)
-    constexpr int FILAMENT_I_ACT  = 0x0034; // u16 (A x1000)
-
-    // Coils (Control)
-    namespace COIL {
-        constexpr int REMOTE_EN   = 0x0000; // 1=Remote
-        constexpr int HV_ON       = 0x0001; // 1=HV On
-        constexpr int PULSE_START = 0x0002; // 1=Pulsing
-        constexpr int FAULT_RESET = 0x0003; // write 1 edge
-        constexpr int FILAMENT_ON = 0x0004; // 1=Filament On
+    for (size_t i = 0; i < reg_count; i++) {
+        unsigned char c1 = buf[2*i];
+        unsigned char c2 = buf[2*i+1];
+        // vendor thường định nghĩa: High=byte0, Low=byte1
+        regs[i] = ((uint16_t)c1 << 8) | c2;
     }
 
-    // Optional command register
-    constexpr int CMD_REG         = 0x0040; // u16 bits
+    int rc = modbus_write_registers(ctx, start_addr, reg_count, regs.data());
+    return (rc == (int)reg_count);
 }
 
-/* ====== Tiện ích đọc 32-bit từ 2 thanh ghi liên tiếp (big-end word order) ======
-   Nếu thiết bị dùng thứ tự khác (lo/hi), đảo lại tương ứng. */
-bool read_u32(modbus_t* ctx, int addr_hi, uint32_t& out)
-{
-    uint16_t regs[2]{};
-    int rc = modbus_read_registers(ctx, addr_hi, 2, regs);
-    if (rc != 2) return false;
-    // Mặc định: regs[0]=HI, regs[1]=LO
-    out = ((uint32_t)regs[0] << 16) | regs[1];
-    return true;
-}
-
-/* ====== Lớp ModbusClient với auto-reconnect ====== */
-class ModbusClient {
-public:
-    ModbusClient(const char* host, int port, int unit)
-        : host_(host), port_(port), unit_(unit), ctx_(nullptr) {}
-
-    ~ModbusClient() { disconnect(); }
-
-    bool connect()
-    {
-        disconnect();
-        ctx_ = modbus_new_tcp(host_, port_);
-        if (!ctx_) {
-            std::cerr << "[E] modbus_new_tcp failed\n";
-            return false;
-        }
-        modbus_set_slave(ctx_, unit_);
-
-        // timeouts
-        timeval t;
-        t.tv_sec = 1; t.tv_usec = 0;             // response timeout 1s
-        modbus_set_response_timeout(ctx_, &t);
-
-        // error recovery (libmodbus sẽ tự close/reopen socket cho 1 số lỗi)
-#ifdef MODBUS_ERROR_RECOVERY_LINK
-        modbus_set_error_recovery(ctx_, (modbus_error_recovery_mode)(
-            MODBUS_ERROR_RECOVERY_LINK | MODBUS_ERROR_RECOVERY_PROTOCOL));
-#endif
-        if (modbus_connect(ctx_) == -1) {
-            std::cerr << "[E] modbus_connect: " << modbus_strerror(errno) << "\n";
-            modbus_free(ctx_); ctx_ = nullptr;
-            return false;
-        }
-        std::cout << "[I] Connected to " << host_ << ":" << port_ << " (unit " << unit_ << ")\n";
-        return true;
+int main() {
+    modbus_t* ctx = modbus_new_tcp("192.168.0.50", 502);
+    modbus_set_slave(ctx, 1);
+    if (modbus_connect(ctx) == -1) {
+        std::cerr << "Connect failed\n";
+        return 1;
     }
 
-    void disconnect()
-    {
-        if (ctx_) {
-            modbus_close(ctx_);
-            modbus_free(ctx_);
-            ctx_ = nullptr;
-        }
-    }
-
-    bool ensure_connected()
-    {
-        if (ctx_) return true;
-        return connect();
-    }
-
-    // Thực hiện 1 hành động, nếu fail thì thử reconnect & retry.
-    template<typename Func>
-    bool with_retry(Func f, int max_retries = 5)
-    {
-        int attempt = 0;
-        int backoff_ms = 200; // tăng dần
-        while (g_running && attempt <= max_retries) {
-            if (!ensure_connected()) {
-                // sleep trước khi thử lại
-                std::this_thread::sleep_for(std::chrono::milliseconds(backoff_ms));
-                backoff_ms = std::min(backoff_ms * 2, 4000);
-                ++attempt;
-                continue;
-            }
-
-            if (f(ctx_)) return true;
-
-            // lỗi: đóng & thử lại
-            std::cerr << "[W] Modbus op failed: " << modbus_strerror(errno)
-                      << " (attempt " << attempt+1 << "/" << max_retries+1 << ")\n";
-            disconnect();
-            std::this_thread::sleep_for(std::chrono::milliseconds(backoff_ms));
-            backoff_ms = std::min(backoff_ms * 2, 4000);
-            ++attempt;
-        }
-        return false;
-    }
-
-private:
-    const char* host_;
-    int port_;
-    int unit_;
-    modbus_t* ctx_;
-};
-
-/* ====== Helpers in/out ====== */
-static std::string yesno(bool v) { return v ? "Yes" : "No"; }
-
-void print_status(modbus_t* ctx)
-{
-    uint16_t v16 = 0;
-    auto rd_u16 = [&](int addr, const char* name) {
-        uint16_t val=0;
-        int rc = modbus_read_registers(ctx, addr, 1, &val);
-        if (rc == 1) {
-            std::cout << "  " << name << " = " << val << "\n";
-        } else {
-            std::cout << "  " << name << " = <err>\n";
-        }
-    };
-
-    // Identification
-    std::cout << "[Identification]\n";
-    rd_u16(REG::MODEL_ID, "ModelID");
-    rd_u16(REG::HW_REV,   "HW_Rev");
-    rd_u16(REG::FW_MAJOR, "FW_Major");
-    rd_u16(REG::FW_MINOR, "FW_Minor");
-
-    uint32_t serial=0, uptime=0;
-    if (read_u32(ctx, REG::SERIAL_HI, serial))
-        std::cout << "  Serial = " << serial << "\n";
-    else
-        std::cout << "  Serial = <err>\n";
-
-    if (read_u32(ctx, REG::UPTIME_HI, uptime))
-        std::cout << "  Uptime = " << uptime << " s\n";
-    else
-        std::cout << "  Uptime = <err>\n";
-
-    // Status
-    std::cout << "[Status]\n";
-    uint16_t status=0, interlock=0, alarm=0, last_fault=0, temp10=0;
-    if (modbus_read_registers(ctx, REG::STATUS_BITS, 1, &status) == 1) {
-        bool ready      = status & (1<<0);
-        bool hv_on      = status & (1<<1);
-        bool pulsing    = status & (1<<2);
-        bool warmup     = status & (1<<3);
-        bool remote_en  = status & (1<<4);
-        bool local_lock = status & (1<<5);
-        std::cout << "  Ready=" << yesno(ready)
-                  << " HV_On=" << yesno(hv_on)
-                  << " Pulsing=" << yesno(pulsing)
-                  << " Warmup=" << yesno(warmup)
-                  << " Remote=" << yesno(remote_en)
-                  << " LocalLock=" << yesno(local_lock) << "\n";
+    if (write_string(ctx, 5121, "HELLO1234", 10)) {
+        std::cout << "Write OK\n";
     } else {
-        std::cout << "  StatusBits = <err>\n";
+        std::cerr << "Write failed\n";
     }
 
-    if (modbus_read_registers(ctx, REG::INTERLOCK_BITS, 1, &interlock) == 1) {
-        std::cout << "  InterlockBits=0x" << std::hex << interlock << std::dec << "\n";
-    } else std::cout << "  InterlockBits=<err>\n";
-
-    if (modbus_read_registers(ctx, REG::ALARM_CODE, 1, &alarm) == 1)
-        std::cout << "  AlarmCode=" << alarm << "\n";
-    else std::cout << "  AlarmCode=<err>\n";
-
-    if (modbus_read_registers(ctx, REG::LAST_FAULT, 1, &last_fault) == 1)
-        std::cout << "  LastFault=" << last_fault << "\n";
-    else std::cout << "  LastFault=<err>\n";
-
-    if (modbus_read_registers(ctx, REG::INTERNAL_TEMP, 1, &temp10) == 1)
-        std::cout << "  Temp=" << (int16_t)temp10 / 10.0 << " °C\n";
-    else std::cout << "  Temp=<err>\n";
-
-    // Readbacks
-    std::cout << "[Readbacks]\n";
-    uint16_t hv=0, pi=0, prf=0, pw=0, fil=0;
-    if (modbus_read_registers(ctx, REG::HV_ACT, 1, &hv)==1)
-        std::cout << "  HV=" << hv/100.0 << " kV\n";
-    else std::cout << "  HV=<err>\n";
-    if (modbus_read_registers(ctx, REG::PULSE_I_ACT, 1, &pi)==1)
-        std::cout << "  PulseI=" << pi/1000.0 << " A\n";
-    else std::cout << "  PulseI=<err>\n";
-    if (modbus_read_registers(ctx, REG::PRF_ACT, 1, &prf)==1)
-        std::cout << "  PRF=" << prf << " Hz\n";
-    else std::cout << "  PRF=<err>\n";
-    if (modbus_read_registers(ctx, REG::PW_ACT, 1, &pw)==1)
-        std::cout << "  PW=" << pw << " us\n";
-    else std::cout << "  PW=<err>\n";
-    if (modbus_read_registers(ctx, REG::FILAMENT_I_ACT, 1, &fil)==1)
-        std::cout << "  FilamentI=" << fil/1000.0 << " A\n";
-    else std::cout << "  FilamentI=<err>\n";
-}
-
-bool write_coil(modbus_t* ctx, int addr, bool val)
-{
-    int rc = modbus_write_bit(ctx, addr, val ? 1 : 0);
-    return (rc == 1);
-}
-
-bool write_u16(modbus_t* ctx, int addr, uint16_t val)
-{
-    int rc = modbus_write_register(ctx, addr, val);
-    return (rc == 1);
-}
-
-/* ====== CLI ====== */
-void print_help()
-{
-    std::cout <<
-    "Commands:\n"
-    "  help                 : Show this help\n"
-    "  status               : Read & print status\n"
-    "  remote on|off        : Enable/Disable remote control\n"
-    "  hv on|off            : HV on/off\n"
-    "  pulse start|stop     : Start/Stop pulsing\n"
-    "  fault reset          : Reset faults\n"
-    "  filament on|off      : Filament on/off\n"
-    "  set hv <kV>          : Set HV setpoint (kV)\n"
-    "  set prf <Hz>         : Set PRF setpoint (Hz)\n"
-    "  set pw <us>          : Set pulse width (us)\n"
-    "  quit/exit            : Exit\n";
-}
-
-/* ====== Main ====== */
-int main()
-{
-    std::signal(SIGINT, handle_sigint);
-    std::signal(SIGTERM, handle_sigint);
-
-    ModbusClient cli(MODBUS_HOST, MODBUS_PORT, MODBUS_UNIT_ID);
-
-    // Kết nối lần đầu (không chết chương trình nếu fail; with_retry sẽ lo)
-    cli.connect();
-
-    print_help();
-    std::string cmd;
-
-    while (g_running) {
-        std::cout << "\n> " << std::flush;
-        if (!std::getline(std::cin, cmd)) break;
-        if (cmd.empty()) continue;
-
-        auto do_with_retry = [&](auto fn){
-            bool ok = cli.with_retry(fn);
-            if (!ok) std::cerr << "[E] Operation failed after retries.\n";
-        };
-
-        if (cmd == "help") {
-            print_help();
-        } else if (cmd == "status") {
-            do_with_retry([&](modbus_t* ctx){ print_status(ctx); return true; });
-        } else if (cmd == "remote on") {
-            do_with_retry([&](modbus_t* ctx){ return write_coil(ctx, REG::COIL::REMOTE_EN, true); });
-        } else if (cmd == "remote off") {
-            do_with_retry([&](modbus_t* ctx){ return write_coil(ctx, REG::COIL::REMOTE_EN, false); });
-        } else if (cmd == "hv on") {
-            do_with_retry([&](modbus_t* ctx){ return write_coil(ctx, REG::COIL::HV_ON, true); });
-        } else if (cmd == "hv off") {
-            do_with_retry([&](modbus_t* ctx){ return write_coil(ctx, REG::COIL::HV_ON, false); });
-        } else if (cmd == "pulse start") {
-            do_with_retry([&](modbus_t* ctx){ return write_coil(ctx, REG::COIL::PULSE_START, true); });
-        } else if (cmd == "pulse stop") {
-            do_with_retry([&](modbus_t* ctx){ return write_coil(ctx, REG::COIL::PULSE_START, false); });
-        } else if (cmd == "fault reset") {
-            // cạnh lên: ghi 1 rồi ghi 0
-            do_with_retry([&](modbus_t* ctx){
-                if (!write_coil(ctx, REG::COIL::FAULT_RESET, true)) return false;
-                std::this_thread::sleep_for(std::chrono::milliseconds(50));
-                return write_coil(ctx, REG::COIL::FAULT_RESET, false);
-            });
-        } else if (cmd == "filament on") {
-            do_with_retry([&](modbus_t* ctx){ return write_coil(ctx, REG::COIL::FILAMENT_ON, true); });
-        } else if (cmd == "filament off") {
-            do_with_retry([&](modbus_t* ctx){ return write_coil(ctx, REG::COIL::FILAMENT_ON, false); });
-        } else if (cmd.rfind("set hv ", 0) == 0) {
-            double kv = 0.0;
-            try { kv = std::stod(cmd.substr(7)); } catch (...) { kv = -1; }
-            if (kv < 0) { std::cerr << "Bad value\n"; continue; }
-            uint16_t raw = static_cast<uint16_t>(kv * 100.0 + 0.5);
-            do_with_retry([&](modbus_t* ctx){ return write_u16(ctx, REG::HV_SET, raw); });
-        } else if (cmd.rfind("set prf ", 0) == 0) {
-            int hz = -1;
-            try { hz = std::stoi(cmd.substr(8)); } catch (...) { hz = -1; }
-            if (hz < 0) { std::cerr << "Bad value\n"; continue; }
-            uint16_t raw = static_cast<uint16_t>(hz);
-            do_with_retry([&](modbus_t* ctx){ return write_u16(ctx, REG::PRF_SET, raw); });
-        } else if (cmd.rfind("set pw ", 0) == 0) {
-            int us = -1;
-            try { us = std::stoi(cmd.substr(7)); } catch (...) { us = -1; }
-            if (us < 0) { std::cerr << "Bad value\n"; continue; }
-            uint16_t raw = static_cast<uint16_t>(us);
-            do_with_retry([&](modbus_t* ctx){ return write_u16(ctx, REG::PW_SET, raw); });
-        } else if (cmd == "quit" || cmd == "exit") {
-            break;
-        } else {
-            std::cout << "Unknown command. Type 'help'.\n";
-        }
-    }
-
-    std::cout << "Bye.\n";
-    return 0;
+    modbus_close(ctx);
+    modbus_free(ctx);
 }
