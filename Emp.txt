@@ -19,26 +19,27 @@ cv::Rect2d refineBrightObject(const cv::Mat& frame, const cv::Rect2d& trackerBox
     cv::Mat mask;
     cv::threshold(gray, mask, threshVal, 255, cv::THRESH_BINARY);
 
-    // Tính moments để lấy tâm
-    cv::Moments m = cv::moments(mask, true);
-    if (m.m00 > 1e-3) {
-        int cx = static_cast<int>(m.m10 / m.m00);
-        int cy = static_cast<int>(m.m01 / m.m00);
+    // Tìm contour lớn nhất trong mask
+    std::vector<std::vector<cv::Point>> contours;
+    cv::findContours(mask, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
 
-        // Đặt ROI centered tại (cx, cy)
-        int boxSize = 20; // hoặc adapt theo kích thước vùng sáng
-        int x = std::max(0, cx - boxSize/2);
-        int y = std::max(0, cy - boxSize/2);
-        int w = std::min(boxSize, gray.cols - x);
-        int h = std::min(boxSize, gray.rows - y);
+    if (!contours.empty()) {
+        // chọn contour lớn nhất
+        size_t maxIdx = 0;
+        double maxArea = 0;
+        for (size_t i = 0; i < contours.size(); i++) {
+            double area = cv::contourArea(contours[i]);
+            if (area > maxArea) { maxArea = area; maxIdx = i; }
+        }
 
-        cv::Rect refined(x, y, w, h);
+        // bounding box quanh contour
+        cv::Rect objectBox = cv::boundingRect(contours[maxIdx]);
 
         // Chuyển về tọa độ global
-        refined.x += trackerBox.x;
-        refined.y += trackerBox.y;
+        objectBox.x += trackerBox.x;
+        objectBox.y += trackerBox.y;
 
-        return refined;
+        return objectBox;
     }
 
     // Nếu không detect được → giữ box gốc
