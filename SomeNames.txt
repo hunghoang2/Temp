@@ -1,13 +1,28 @@
-cv::Mat gray, mask;
-cv::cvtColor(frame(roi), gray, cv::COLOR_BGR2GRAY);
-cv::threshold(gray, mask, 50, 255, cv::THRESH_BINARY);
-std::vector<std::vector<cv::Point>> contours;
-cv::findContours(mask, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
+cv::Rect2d refineBrightSpot(const cv::Mat& frame, const cv::Rect2d& trackerBox) {
+    // Cắt ROI từ tracker
+    cv::Mat roiImg = frame(trackerBox).clone();
 
-if (!contours.empty()) {
-    cv::Rect objectBox = cv::boundingRect(contours[0]);
-    roi.x += objectBox.x;
-    roi.y += objectBox.y;
-    roi.width = objectBox.width;
-    roi.height = objectBox.height;
+    // Chuyển sang gray
+    cv::Mat gray;
+    cv::cvtColor(roiImg, gray, cv::COLOR_BGR2GRAY);
+
+    // Tìm điểm sáng nhất
+    double minVal, maxVal;
+    cv::Point minLoc, maxLoc;
+    cv::minMaxLoc(gray, &minVal, &maxVal, &minLoc, &maxLoc);
+
+    // Xác định kích thước box quanh điểm sáng
+    int boxSize = 20; // hoặc adapt theo cường độ sáng
+    int x = std::max(0, maxLoc.x - boxSize/2);
+    int y = std::max(0, maxLoc.y - boxSize/2);
+    int w = std::min(boxSize, gray.cols - x);
+    int h = std::min(boxSize, gray.rows - y);
+
+    cv::Rect refined(x, y, w, h);
+
+    // Chuyển về tọa độ full frame
+    refined.x += trackerBox.x;
+    refined.y += trackerBox.y;
+
+    return refined;
 }
