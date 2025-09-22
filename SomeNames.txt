@@ -1,380 +1,61 @@
-/*
-Qt + OpenCV single-file example: 2-axis camera tracking with Kalman prediction and PID control.
-- Camera capture runs in a QThread at camera FPS (~25 fps).
-- Control loop runs at 30 Hz (QTimer) and uses Kalman to predict when no new frame.
-- Target tracking uses OpenCV Tracker (CSRT/KCF) with user-initialized bounding-box or auto-detect fallback.
-- MotorInterface replaced with RestMotorInterface using QtNetwork to send RESTful POST.
-
-Build (CMake):
-- Requires Qt (5 or 6) with Core, Gui, Widgets, Network and OpenCV.
-- Example CMakeLists provided below.
-
-Notes:
-- Tune PID gains and Kalman / process noise for your system.
-- Set CAMERA_ID to your camera index or video stream.
-- Provide FOV_X/FOV_Y in degrees of the camera lens.
-*/
-
-#include <QApplication>
-#include <QWidget>
-#include <QLabel>
-#include <QVBoxLayout>
-#include <QTimer>
-#include <QThread>
-#include <QImage>
-#include <QMutex>
-#include <QMutexLocker>
-#include <QDateTime>
-#include <QDebug>
-#include <QMouseEvent>
-#include <QNetworkAccessManager>
-#include <QNetworkRequest>
-#include <QNetworkReply>
-#include <QJsonObject>
-#include <QJsonDocument>
-
 #include <opencv2/opencv.hpp>
 #include <opencv2/tracking.hpp>
 
-#include <cmath>
-#include <optional>
+int main() {
+    cv::VideoCapture cap("video.mp4");
+    if (!cap.isOpened()) return -1;
 
-// ---------- Configuration ----------
-const int CAMERA_ID = 0;            // camera index or video file
-const double CONTROL_HZ = 30.0;     // control loop frequency
-const double CAMERA_FPS = 25.0;     // expected camera fps
-const double FOV_X_DEG = 60.0;      // horizontal field-of-view in degrees
-const double FOV_Y_DEG = 35.0;      // vertical field-of-view in degrees
+    cv::Mat frame;
+    cap.read(frame);
 
-// REST endpoint for motor control
-const QString MOTOR_URL = "http://127.0.0.1:8080/motor"; // adjust to your server
+    // Initialize tracker
+    cv::Rect2d roi = cv::selectROI("Tracker", frame);
+    cv::Ptr<cv::Tracker> tracker = cv::TrackerCSRT::create();
+    tracker->init(frame, roi);
 
-// ---------- Utility ----------
-static double deg2rad(double d){ return d*M_PI/180.0; }
-static double rad2deg(double r){ return r*180.0/M_PI; }
+    while (cap.read(frame)) {
+        if (tracker->update(frame, roi)) {
+            // Crop ROI region from frame
+            cv::Mat roiImg = frame(roi).clone();
 
-// ---------- PID Controller ----------
-class PID {
-public:
-    PID(double kp=0.0, double ki=0.0, double kd=0.0, double outMin=-1e9, double outMax=1e9)
-        : kp(kp), ki(ki), kd(kd), outMin(outMin), outMax(outMax) {}
+            // Preprocess (convert to gray + threshold)
+            cv::Mat gray, mask;
+            cv::cvtColor(roiImg, gray, cv::COLOR_BGR2GRAY);
+            cv::threshold(gray, mask, 0, 255, cv::THRESH_BINARY | cv::THRESH_OTSU);
 
-    double update(double error, double dt) {
-        if (dt <= 0.0) return 0.0;
-        integral += error * dt;
-        double derivative = (error - lastError) / dt;
-        double out = kp*error + ki*integral + kd*derivative;
-        if (out > outMax) out = outMax;
-        if (out < outMin) out = outMin;
-        lastError = error;
-        return out;
-    }
+            // Find contours
+            std::vector<std::vector<cv::Point>> contours;
+            cv::findContours(mask, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
 
-    void reset(){ integral = 0; lastError = 0; }
+            if (!contours.empty()) {
+                // Take largest contour
+                size_t maxIdx = 0;
+                double maxArea = 0;
+                for (size_t i = 0; i < contours.size(); i++) {
+                    double area = cv::contourArea(contours[i]);
+                    if (area > maxArea) { maxArea = area; maxIdx = i; }
+                }
 
-    double kp, ki, kd;
-private:
-    double integral = 0.0;
-    double lastError = 0.0;
-    double outMin, outMax;
-};
+                // Get bounding box of largest contour
+                cv::Rect refinedBox = cv::boundingRect(contours[maxIdx]);
 
-// ---------- Motor Interface using RESTful POST ----------
-class RestMotorInterface : public QObject {
-    Q_OBJECT
-public:
-    RestMotorInterface(QObject* parent=nullptr) : QObject(parent) {
-        nam = new QNetworkAccessManager(this);
-    }
+                // Shift back to full-frame coordinates
+                refinedBox.x += roi.x;
+                refinedBox.y += roi.y;
 
-    void sendAngles(double az_deg, double el_deg) {
-        QJsonObject json;
-        json["azimuth"] = az_deg;
-        json["elevation"] = el_deg;
-        QJsonDocument doc(json);
-        QByteArray data = doc.toJson();
-
-        QNetworkRequest req(QUrl(MOTOR_URL));
-        req.setHeader(QNetworkRequest::ContentTypeHeader, "application/json");
-        nam->post(req, data);
-        qDebug() << "POST motor:" << data;
-    }
-
-private:
-    QNetworkAccessManager* nam;
-};
-
-// ---------- Camera Capture Thread ----------
-class CameraThread : public QThread {
-    Q_OBJECT
-public:
-    CameraThread(int cam_id, QObject* parent=nullptr) : QThread(parent), cam_id(cam_id) {}
-    ~CameraThread(){ requestInterruption(); wait(); }
-
-signals:
-    void frameReady(const cv::Mat& frame, qint64 ts_ms);
-
-protected:
-    void run() override {
-        cv::VideoCapture cap;
-        if (!cap.open(cam_id)) {
-            qWarning() << "Camera open failed for id" << cam_id;
-            return;
-        }
-        cap.set(cv::CAP_PROP_FPS, CAMERA_FPS);
-        while (!isInterruptionRequested()) {
-            cv::Mat frame;
-            bool ok = cap.read(frame);
-            qint64 ts = QDateTime::currentMSecsSinceEpoch();
-            if (!ok || frame.empty()) {
-                msleep(5);
-                continue;
+                // Update ROI
+                roi = refinedBox;
             }
-            emit frameReady(frame, ts);
-            QThread::msleep(1);
-        }
-    }
-private:
-    int cam_id;
-};
 
-// ---------- Main Widget: shows frame & allows bounding-box init ----------
-class VideoWidget : public QLabel {
-    Q_OBJECT
-public:
-    VideoWidget(QWidget* parent=nullptr) : QLabel(parent) {
-        setAlignment(Qt::AlignCenter);
-        setMouseTracking(true);
-        setMinimumSize(640,480);
-    }
-
-    void setImage(const QImage& img){
-        currentImage = img;
-        setPixmap(QPixmap::fromImage(img).scaled(size(), Qt::KeepAspectRatio));
-    }
-
-signals:
-    void bboxSelected(const QRect& box);
-
-protected:
-    void mousePressEvent(QMouseEvent* ev) override {
-        if (ev->button()==Qt::LeftButton) {
-            startPoint = ev->pos();
-            selecting = true;
-        }
-    }
-    void mouseMoveEvent(QMouseEvent* ev) override {
-        if (selecting) {
-            endPoint = ev->pos();
-            update();
-        }
-    }
-    void mouseReleaseEvent(QMouseEvent* ev) override {
-        if (selecting && ev->button()==Qt::LeftButton) {
-            endPoint = ev->pos();
-            selecting = false;
-            QRect rect = QRect(startPoint, endPoint).normalized();
-            emit bboxSelected(rect);
-        }
-    }
-    void paintEvent(QPaintEvent* ev) override {
-        QLabel::paintEvent(ev);
-        if (selecting) {
-            QPainter p(this);
-            p.setPen(QPen(Qt::red,2));
-            QRect rect(startPoint, endPoint);
-            p.drawRect(rect);
-        }
-    }
-
-private:
-    QImage currentImage;
-    bool selecting=false;
-    QPoint startPoint, endPoint;
-};
-
-// ---------- Tracker + Control Manager ----------
-class TrackerControl : public QObject {
-    Q_OBJECT
-public:
-    TrackerControl(int cam_w, int cam_h, QObject* parent=nullptr)
-        : QObject(parent), cam_w(cam_w), cam_h(cam_h)
-    {
-        kf = cv::KalmanFilter(4, 2);
-        kf.transitionMatrix = (cv::Mat_<float>(4,4) << 1,0,1,0,  0,1,0,1,  0,0,1,0,  0,0,0,1);
-        kf.measurementMatrix = cv::Mat::zeros(2,4,CV_32F);
-        kf.measurementMatrix.at<float>(0,0) = 1.0f;
-        kf.measurementMatrix.at<float>(1,1) = 1.0f;
-        setIdentity(kf.processNoiseCov, cv::Scalar::all(1e-2));
-        setIdentity(kf.measurementNoiseCov, cv::Scalar::all(1e-1));
-        setIdentity(kf.errorCovPost, cv::Scalar::all(1));
-
-        hasState = false;
-        pid_az = PID(0.6, 0.01, 0.05, -30.0, 30.0);
-        pid_el = PID(0.6, 0.01, 0.05, -30.0, 30.0);
-
-        motor = new RestMotorInterface(this);
-        commandedAz = 0.0; commandedEl = 0.0;
-        lastPredictTs = QDateTime::currentMSecsSinceEpoch();
-        tracker = cv::TrackerKCF::create();
-    }
-
-public slots:
-    void onFrame(const cv::Mat& frame, qint64 ts_ms) {
-        QMutexLocker locker(&m);
-        latestFrame = frame.clone();
-        frameTs = ts_ms;
-    }
-
-    void onBboxSelected(const QRect& box) {
-        if (!latestFrame.empty()) {
-            cv::Rect roi(box.x(), box.y(), box.width(), box.height());
-            tracker = cv::TrackerKCF::create();
-            tracker->init(latestFrame, roi);
-            trackerInitialized = true;
-            initKalmanWithMeasurement(cv::Point2f(roi.x+roi.width/2.0f, roi.y+roi.height/2.0f));
-        }
-    }
-
-    void onControlTick() {
-        cv::Mat frame;
-        {
-            QMutexLocker locker(&m);
-            if (!latestFrame.empty()) frame = latestFrame.clone();
-        }
-        double dt = 1.0 / CONTROL_HZ;
-        qint64 now = QDateTime::currentMSecsSinceEpoch();
-        double dtPredict = (now - lastPredictTs) / 1000.0;
-        if (dtPredict <= 0) dtPredict = dt;
-        lastPredictTs = now;
-
-        bool measured=false;
-        cv::Point2f measuredPt;
-        if (!frame.empty() && trackerInitialized) {
-            cv::Rect2d box;
-            if (tracker->update(frame, box)) {
-                measuredPt = cv::Point2f(box.x+box.width/2.0f, box.y+box.height/2.0f);
-                measured = true;
-                if (!hasState) initKalmanWithMeasurement(measuredPt);
-            }
+            // Draw refined ROI
+            cv::rectangle(frame, roi, cv::Scalar(0, 255, 0), 2);
         }
 
-        kf.transitionMatrix.at<float>(0,2) = (float)dtPredict;
-        kf.transitionMatrix.at<float>(1,3) = (float)dtPredict;
-        cv::Mat prediction = kf.predict();
-        if (measured) {
-            cv::Mat meas(2,1,CV_32F);
-            meas.at<float>(0) = measuredPt.x;
-            meas.at<float>(1) = measuredPt.y;
-            kf.correct(meas);
-        }
-        cv::Mat statePost = kf.statePost;
-        double u_hat = statePost.at<float>(0);
-        double v_hat = statePost.at<float>(1);
-
-        double e_x = u_hat - (cam_w/2.0);
-        double e_y = v_hat - (cam_h/2.0);
-        double ang_x_deg = (e_x / cam_w) * FOV_X_DEG;
-        double ang_y_deg = (e_y / cam_h) * FOV_Y_DEG;
-
-        double az_cmd = pid_az.update(ang_x_deg, dt);
-        double el_cmd = pid_el.update(ang_y_deg, dt);
-
-        commandedAz += az_cmd * dt;
-        commandedEl += el_cmd * dt;
-
-        motor->sendAngles(commandedAz, commandedEl);
-
-        if (!frame.empty()) {
-            cv::Mat vis = frame.clone();
-            cv::circle(vis, cv::Point(cam_w/2, cam_h/2), 4, cv::Scalar(0,255,0), -1);
-            if (measured) cv::circle(vis, measuredPt, 5, cv::Scalar(0,0,255), -1);
-            cv::circle(vis, cv::Point((int)u_hat,(int)v_hat), 5, cv::Scalar(255,0,0), 2);
-            QImage qimg(vis.data, vis.cols, vis.rows, (int)vis.step, QImage::Format_BGR888);
-            emit frameForDisplay(qimg.copy());
-        }
+        cv::imshow("Tracking", frame);
+        if (cv::waitKey(30) == 27) break;
     }
-
-signals:
-    void frameForDisplay(const QImage& img);
-
-private:
-    void initKalmanWithMeasurement(const cv::Point2f& p) {
-        kf.statePost.at<float>(0) = p.x;
-        kf.statePost.at<float>(1) = p.y;
-        kf.statePost.at<float>(2) = 0.0f;
-        kf.statePost.at<float>(3) = 0.0f;
-        hasState = true;
-    }
-
-    QMutex m;
-    cv::Mat latestFrame;
-    qint64 frameTs=0;
-
-    int cam_w, cam_h;
-    cv::Ptr<cv::Tracker> tracker;
-    bool trackerInitialized=false;
-
-    cv::KalmanFilter kf;
-    bool hasState;
-
-    PID pid_az, pid_el;
-    RestMotorInterface* motor;
-    double commandedAz, commandedEl;
-    qint64 lastPredictTs;
-};
-
-// ---------- Main ----------
-int main(int argc, char *argv[]) {
-    QApplication a(argc, argv);
-
-    cv::VideoCapture cap;
-    if (!cap.open(CAMERA_ID)) {
-        qWarning() << "Cannot open camera" << CAMERA_ID;
-        return -1;
-    }
-    int cam_w = (int)cap.get(cv::CAP_PROP_FRAME_WIDTH);
-    int cam_h = (int)cap.get(cv::CAP_PROP_FRAME_HEIGHT);
-    if (cam_w<=0||cam_h<=0) { cam_w=640; cam_h=480; }
-    cap.release();
-
-    VideoWidget w;
-    w.resize(cam_w/2, cam_h/2);
-    w.show();
-
-    CameraThread camThread(CAMERA_ID);
-    TrackerControl manager(cam_w, cam_h);
-
-    QObject::connect(&camThread, &CameraThread::frameReady, &manager, &TrackerControl::onFrame);
-    QObject::connect(&manager, &TrackerControl::frameForDisplay, &w, &VideoWidget::setImage);
-    QObject::connect(&w, &VideoWidget::bboxSelected, &manager, &TrackerControl::onBboxSelected);
-
-    camThread.start();
-
-    QTimer controlTimer;
-    controlTimer.setInterval((int)(1000.0/CONTROL_HZ));
-    QObject::connect(&controlTimer, &QTimer::timeout, &manager, &TrackerControl::onControlTick);
-    controlTimer.start();
-
-    int ret = a.exec();
-    camThread.requestInterruption();
-    camThread.wait();
-    return ret;
+    return 0;
 }
-
-/*
-CMakeLists.txt example:
-
-cmake_minimum_required(VERSION 3.10)
-project(QtTargetTracker)
-set(CMAKE_CXX_STANDARD 17)
-find_package(Qt5 COMPONENTS Widgets Network REQUIRED)
-find_package(OpenCV REQUIRED)
-
-add_executable(QtTargetTracker qt_target_tracking.cpp)
-target_include_directories(QtTargetTracker PRIVATE ${OpenCV_INCLUDE_DIRS})
-target_link_libraries(QtTargetTracker PRIVATE Qt5::Widgets Qt5::Network ${OpenCV_LIBS})
-*/
 
 
 Mình đã cập nhật mã để:
