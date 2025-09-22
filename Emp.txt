@@ -35,3 +35,12 @@ cv::Rect2d refineBrightObject(const cv::Mat& frame, const cv::Rect2d& trackerBox
         cv::Rect refined(x, y, w, h);
 
         // Chuyển về tọa độ global
+        refined.x += trackerBox.x;
+        refined.y += trackerBox.y;
+
+        return refined;
+    }
+
+    // Nếu không detect được → giữ box gốc
+    return trackerBox;
+}
