@@ -1,45 +1,37 @@
-#include <modbus/modbus.h>
-#include <string>
-#include <vector>
-#include <iostream>
+cv::Rect2d refineBrightObject(const cv::Mat& frame, const cv::Rect2d& trackerBox) {
+    // Crop ROI từ tracker
+    cv::Mat roiImg = frame(trackerBox).clone();
 
-bool write_string(modbus_t* ctx, int start_addr, const std::string& str, size_t max_chars)
-{
-    // copy và zero terminate
-    std::string buf = str.substr(0, max_chars-1);
-    buf.push_back('\0');
+    // Chuyển sang gray
+    cv::Mat gray;
+    cv::cvtColor(roiImg, gray, cv::COLOR_BGR2GRAY);
 
-    // pad cho chẵn số byte
-    if (buf.size() % 2 != 0) buf.push_back('\0');
+    // Tìm độ sáng max trong ROI
+    double minVal, maxVal;
+    cv::Point minLoc, maxLoc;
+    cv::minMaxLoc(gray, &minVal, &maxVal, &minLoc, &maxLoc);
 
-    size_t reg_count = buf.size() / 2;
-    std::vector<uint16_t> regs(reg_count);
+    // Nếu ROI quá tối thì trả về box gốc
+    if (maxVal < 30) return trackerBox;
 
-    for (size_t i = 0; i < reg_count; i++) {
-        unsigned char c1 = buf[2*i];
-        unsigned char c2 = buf[2*i+1];
-        // vendor thường định nghĩa: High=byte0, Low=byte1
-        regs[i] = ((uint16_t)c1 << 8) | c2;
-    }
+    // Adaptive threshold (ví dụ lấy 70% max intensity)
+    double threshVal = maxVal * 0.7;
+    cv::Mat mask;
+    cv::threshold(gray, mask, threshVal, 255, cv::THRESH_BINARY);
 
-    int rc = modbus_write_registers(ctx, start_addr, reg_count, regs.data());
-    return (rc == (int)reg_count);
-}
+    // Tính moments để lấy tâm
+    cv::Moments m = cv::moments(mask, true);
+    if (m.m00 > 1e-3) {
+        int cx = static_cast<int>(m.m10 / m.m00);
+        int cy = static_cast<int>(m.m01 / m.m00);
 
-int main() {
-    modbus_t* ctx = modbus_new_tcp("192.168.0.50", 502);
-    modbus_set_slave(ctx, 1);
-    if (modbus_connect(ctx) == -1) {
-        std::cerr << "Connect failed\n";
-        return 1;
-    }
+        // Đặt ROI centered tại (cx, cy)
+        int boxSize = 20; // hoặc adapt theo kích thước vùng sáng
+        int x = std::max(0, cx - boxSize/2);
+        int y = std::max(0, cy - boxSize/2);
+        int w = std::min(boxSize, gray.cols - x);
+        int h = std::min(boxSize, gray.rows - y);
 
-    if (write_string(ctx, 5121, "HELLO1234", 10)) {
-        std::cout << "Write OK\n";
-    } else {
-        std::cerr << "Write failed\n";
-    }
+        cv::Rect refined(x, y, w, h);
 
-    modbus_close(ctx);
-    modbus_free(ctx);
-}
+        // Chuyển về tọa độ global
