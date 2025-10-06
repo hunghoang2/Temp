@@ -12,35 +12,41 @@ MainWindow::MainWindow(QWidget *parent)
 
 void MainWindow::onServerStatusUpdated(const ServerStatus &status)
 {
-    QString errCode = status.err_code;
-    QString errMsg  = status.err_msg;
+    QSet<QString> currentErrors;
+    for (const auto &err : status.errors)
+        currentErrors.insert(err.code);
 
-    // Không có lỗi -> reset trạng thái
-    if (errCode.isEmpty()) {
-        m_lastErrorCode.clear();
-        m_messageBoxVisible = false;
-        return;
+    // 1️⃣ Loại bỏ lỗi đã biến mất khỏi server
+    for (auto it = m_activeErrors.begin(); it != m_activeErrors.end(); )
+    {
+        if (!currentErrors.contains(*it))
+            it = m_activeErrors.erase(it); // lỗi biến mất
+        else
+            ++it;
     }
 
-    // Nếu đang hiển thị và lỗi không đổi -> bỏ qua
-    if (m_messageBoxVisible && errCode == m_lastErrorCode)
-        return;
+    // 2️⃣ Duyệt lỗi mới để hiển thị
+    for (const auto &err : status.errors)
+    {
+        if (m_activeErrors.contains(err.code))
+            continue; // lỗi này đã hiển thị rồi
 
-    // Lỗi mới hoặc chưa hiển thị
-    m_lastErrorCode = errCode;
-    m_messageBoxVisible = true;
+        // Hiển thị lỗi mới
+        auto *msgBox = new QMessageBox(QMessageBox::Critical,
+                                       "Lỗi hệ thống",
+                                       QString("Mã lỗi: %1\n%2").arg(err.code, err.message),
+                                       QMessageBox::Ok,
+                                       this);
 
-    auto *msgBox = new QMessageBox(QMessageBox::Critical,
-                                   "Lỗi hệ thống",
-                                   QString("Mã lỗi: %1\n%2").arg(errCode, errMsg),
-                                   QMessageBox::Ok,
-                                   this);
+        // Khi người dùng tắt, loại bỏ lỗi khỏi danh sách
+        connect(msgBox, &QMessageBox::finished, this, [=](int){
+            m_activeErrors.remove(err.code);
+            msgBox->deleteLater();
+        });
 
-    connect(msgBox, &QMessageBox::finished, this, [=](int){
-        m_messageBoxVisible = false;
-        m_lastErrorCode.clear();
-        msgBox->deleteLater();
-    });
+        msgBox->show();
 
-    msgBox->show();
+        // Đánh dấu lỗi đã hiển thị
+        m_activeErrors.insert(err.code);
+    }
 }
