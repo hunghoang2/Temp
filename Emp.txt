@@ -1,47 +1,89 @@
-cv::Rect2d refineBrightObject(const cv::Mat& frame, const cv::Rect2d& trackerBox) {
-    // Crop ROI từ tracker
-    cv::Mat roiImg = frame(trackerBox).clone();
+#pragma once
+#include <zmq.hpp>
+#include <thread>
+#include <atomic>
+#include <functional>
+#include <string>
 
-    // Chuyển sang gray
-    cv::Mat gray;
-    cv::cvtColor(roiImg, gray, cv::COLOR_BGR2GRAY);
+class ZmqServer {
+public:
+    using MessageCallback = std::function<void(const std::string&)>;
 
-    // Tìm độ sáng max trong ROI
-    double minVal, maxVal;
-    cv::Point minLoc, maxLoc;
-    cv::minMaxLoc(gray, &minVal, &maxVal, &minLoc, &maxLoc);
+    ZmqServer(int port);
+    ~ZmqServer();
 
-    // Nếu ROI quá tối thì trả về box gốc
-    if (maxVal < 30) return trackerBox;
+    void start();
+    void stop();
 
-    // Adaptive threshold (ví dụ lấy 70% max intensity)
-    double threshVal = maxVal * 0.7;
-    cv::Mat mask;
-    cv::threshold(gray, mask, threshVal, 255, cv::THRESH_BINARY);
+    void setMessageCallback(MessageCallback cb);
 
-    // Tìm contour lớn nhất trong mask
-    std::vector<std::vector<cv::Point>> contours;
-    cv::findContours(mask, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
+private:
+    void run();
 
-    if (!contours.empty()) {
-        // chọn contour lớn nhất
-        size_t maxIdx = 0;
-        double maxArea = 0;
-        for (size_t i = 0; i < contours.size(); i++) {
-            double area = cv::contourArea(contours[i]);
-            if (area > maxArea) { maxArea = area; maxIdx = i; }
-        }
+    int m_port;
+    std::thread m_thread;
+    std::atomic<bool> m_running{false};
 
-        // bounding box quanh contour
-        cv::Rect objectBox = cv::boundingRect(contours[maxIdx]);
+    zmq::context_t m_context{1};
+    zmq::socket_t m_socket{m_context, zmq::socket_type::rep};
 
-        // Chuyển về tọa độ global
-        objectBox.x += trackerBox.x;
-        objectBox.y += trackerBox.y;
+    MessageCallback m_callback;
+};
+#include "ZmqServer.h"
+#include <iostream>
 
-        return objectBox;
-    }
+ZmqServer::ZmqServer(int port)
+    : m_port(port)
+{}
 
-    // Nếu không detect được → giữ box gốc
-    return trackerBox;
+ZmqServer::~ZmqServer() {
+    stop();
 }
+
+void ZmqServer::start() {
+    if (m_running) return;
+    m_running = true;
+
+    m_thread = std::thread(&ZmqServer::run, this);
+}
+
+void ZmqServer::stop() {
+    if (!m_running) return;
+    m_running = false;
+
+    // Gửi tín hiệu wake up socket
+    m_socket.close();
+
+    if (m_thread.joinable())
+        m_thread.join();
+}
+
+void ZmqServer::setMessageCallback(MessageCallback cb) {
+    m_callback = std::move(cb);
+}
+
+void ZmqServer::run() {
+    try {
+        std::string bind_addr = "tcp://*:" + std::to_string(m_port);
+        m_socket.bind(bind_addr);
+        std::cout << "[ZmqServer] Listening on " << bind_addr << std::endl;
+
+        while (m_running) {
+            zmq::message_t request;
+            auto result = m_socket.recv(request, zmq::recv_flags::none);
+            if (!result || !m_running)
+                break;
+
+            std::string msg(static_cast<char*>(request.data()), request.size());
+            if (m_callback)
+                m_callback(msg);
+
+            // Gửi ACK lại
+            m_socket.send(zmq::buffer("ACK"), zmq::send_flags::none);
+        }
+    } catch (std::exception& e) {
+        std::cerr << "[ZmqServer] Error: " << e.what() << std::endl;
+    }
+}
+
+
