@@ -1,89 +1,180 @@
 #pragma once
-#include <zmq.hpp>
-#include <thread>
+#include <QObject>
+#include <QThread>
+#include <QString>
+#include <QTimer>
 #include <atomic>
-#include <functional>
-#include <string>
+#include <zmq.hpp>
 
-class ZmqServer {
+class ZmqClientQt : public QObject
+{
+    Q_OBJECT
+
 public:
-    using MessageCallback = std::function<void(const std::string&)>;
+    explicit ZmqClientQt(const QString& ip, int port, QObject* parent = nullptr);
+    ~ZmqClientQt();
 
-    ZmqServer(int port);
-    ~ZmqServer();
-
+public slots:
     void start();
     void stop();
+    void sendMessage(const QString& msg);
 
-    void setMessageCallback(MessageCallback cb);
+signals:
+    void messageReceived(const QString& msg);
+    void connected();
+    void disconnected();
+    void errorOccurred(const QString& err);
+    void reconnecting();
+
+private slots:
+    void processMessages();
+    void tryReconnect();
 
 private:
-    void run();
+    void connectSocket();
+    void closeSocket();
 
+private:
+    QString m_ip;
     int m_port;
-    std::thread m_thread;
+    QThread m_thread;
+    QTimer* m_reconnectTimer{nullptr};
     std::atomic<bool> m_running{false};
 
     zmq::context_t m_context{1};
-    zmq::socket_t m_socket{m_context, zmq::socket_type::rep};
+    std::unique_ptr<zmq::socket_t> m_socket;
 
-    MessageCallback m_callback;
+    bool m_connected{false};
 };
-#include "ZmqServer.h"
-#include <iostream>
 
-ZmqServer::ZmqServer(int port)
-    : m_port(port)
-{}
 
-ZmqServer::~ZmqServer() {
+
+
+
+
+
+#include "ZmqClientQt.h"
+#include <QDebug>
+#include <QMetaObject>
+#include <chrono>
+#include <thread>
+
+ZmqClientQt::ZmqClientQt(const QString& ip, int port, QObject* parent)
+    : QObject(parent), m_ip(ip), m_port(port)
+{
+    moveToThread(&m_thread);
+
+    connect(&m_thread, &QThread::started, this, &ZmqClientQt::processMessages);
+    connect(&m_thread, &QThread::finished, this, [=](){
+        qDebug() << "ZmqClientQt thread stopped";
+    });
+
+    m_reconnectTimer = new QTimer(this);
+    m_reconnectTimer->setInterval(1000); // mỗi 1s thử reconnect
+    connect(m_reconnectTimer, &QTimer::timeout, this, &ZmqClientQt::tryReconnect);
+}
+
+ZmqClientQt::~ZmqClientQt() {
     stop();
 }
 
-void ZmqServer::start() {
+void ZmqClientQt::start() {
     if (m_running) return;
     m_running = true;
-
-    m_thread = std::thread(&ZmqServer::run, this);
+    m_thread.start();
 }
 
-void ZmqServer::stop() {
+void ZmqClientQt::stop() {
     if (!m_running) return;
     m_running = false;
+    closeSocket();
 
-    // Gửi tín hiệu wake up socket
-    m_socket.close();
-
-    if (m_thread.joinable())
-        m_thread.join();
-}
-
-void ZmqServer::setMessageCallback(MessageCallback cb) {
-    m_callback = std::move(cb);
-}
-
-void ZmqServer::run() {
-    try {
-        std::string bind_addr = "tcp://*:" + std::to_string(m_port);
-        m_socket.bind(bind_addr);
-        std::cout << "[ZmqServer] Listening on " << bind_addr << std::endl;
-
-        while (m_running) {
-            zmq::message_t request;
-            auto result = m_socket.recv(request, zmq::recv_flags::none);
-            if (!result || !m_running)
-                break;
-
-            std::string msg(static_cast<char*>(request.data()), request.size());
-            if (m_callback)
-                m_callback(msg);
-
-            // Gửi ACK lại
-            m_socket.send(zmq::buffer("ACK"), zmq::send_flags::none);
-        }
-    } catch (std::exception& e) {
-        std::cerr << "[ZmqServer] Error: " << e.what() << std::endl;
+    if (m_thread.isRunning()) {
+        m_thread.quit();
+        m_thread.wait();
     }
 }
+
+void ZmqClientQt::connectSocket() {
+    try {
+        closeSocket();
+        std::string addr = "tcp://" + m_ip.toStdString() + ":" + std::to_string(m_port);
+        m_socket = std::make_unique<zmq::socket_t>(m_context, zmq::socket_type::req);
+        m_socket->connect(addr);
+        m_connected = true;
+        emit connected();
+        qDebug() << "[ZmqClientQt] Connected to" << QString::fromStdString(addr);
+    } catch (const zmq::error_t& e) {
+        emit errorOccurred(QString::fromStdString(e.what()));
+        m_connected = false;
+    }
+}
+
+void ZmqClientQt::closeSocket() {
+    if (m_socket) {
+        try {
+            m_socket->close();
+        } catch (...) {}
+        m_socket.reset();
+    }
+    if (m_connected) {
+        m_connected = false;
+        emit disconnected();
+    }
+}
+
+void ZmqClientQt::sendMessage(const QString& msg) {
+    if (!m_running || !m_connected || !m_socket) return;
+    try {
+        std::string data = msg.toStdString();
+        m_socket->send(zmq::buffer(data), zmq::send_flags::none);
+    } catch (const zmq::error_t& e) {
+        emit errorOccurred(QString::fromStdString(e.what()));
+        closeSocket();
+        emit reconnecting();
+        m_reconnectTimer->start();
+    }
+}
+
+void ZmqClientQt::processMessages() {
+    connectSocket();
+
+    while (m_running) {
+        if (m_connected && m_socket) {
+            try {
+                zmq::message_t reply;
+                auto ok = m_socket->recv(reply, zmq::recv_flags::dontwait);
+                if (ok) {
+                    QString msg = QString::fromStdString(
+                        std::string(static_cast<char*>(reply.data()), reply.size()));
+                    emit messageReceived(msg);
+                }
+            } catch (const zmq::error_t& e) {
+                emit errorOccurred(QString::fromStdString(e.what()));
+                closeSocket();
+                emit reconnecting();
+                m_reconnectTimer->start();
+            }
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+
+    closeSocket();
+}
+
+void ZmqClientQt::tryReconnect() {
+    if (!m_running) return;
+    if (m_connected) {
+        m_reconnectTimer->stop();
+        return;
+    }
+
+    qDebug() << "[ZmqClientQt] Trying to reconnect...";
+    connectSocket();
+    if (m_connected)
+        m_reconnectTimer->stop();
+}
+
+
 
 
