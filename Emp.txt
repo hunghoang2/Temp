@@ -1,37 +1,58 @@
-#include <QCoreApplication>
-#include "ZmqClientQt.h"
+#include <iostream>
+#include <fstream>
+#include <sstream>
+#include <string>
+#include <regex>
 
-int main(int argc, char *argv[])
+void replaceJsonFields(const std::string& filePath,
+                       double newLat, double newLon, double newAlt)
 {
-    QCoreApplication app(argc, argv);
+    // Đọc toàn bộ file vào string
+    std::ifstream file(filePath);
+    if (!file.is_open()) {
+        std::cerr << "Không thể mở file " << filePath << std::endl;
+        return;
+    }
 
-    ZmqClientQt client("192.168.0.100", 5000);
+    std::ostringstream buffer;
+    buffer << file.rdbuf();
+    std::string content = buffer.str();
+    file.close();
 
-    QObject::connect(&client, &ZmqClientQt::connected, [](){
-        qDebug() << "[App] Connected to server";
-    });
-    QObject::connect(&client, &ZmqClientQt::reconnecting, [](){
-        qDebug() << "[App] Reconnecting...";
-    });
-    QObject::connect(&client, &ZmqClientQt::disconnected, [](){
-        qDebug() << "[App] Disconnected";
-    });
-    QObject::connect(&client, &ZmqClientQt::messageReceived, [](const QString& msg){
-        qDebug() << "[App] Got reply:" << msg;
-    });
-    QObject::connect(&client, &ZmqClientQt::errorOccurred, [](const QString& err){
-        qWarning() << "[App] Error:" << err;
-    });
+    // Regex: thay giá trị của latitude
+    content = std::regex_replace(
+        content,
+        std::regex(R"("latitude"\s*:\s*[-+]?\d*\.?\d+)"),
+        "\"latitude\": " + std::to_string(newLat)
+    );
 
-    client.start();
+    // Regex: thay giá trị của longitude
+    content = std::regex_replace(
+        content,
+        std::regex(R"("longitude"\s*:\s*[-+]?\d*\.?\d+)"),
+        "\"longitude\": " + std::to_string(newLon)
+    );
 
-    // Gửi dữ liệu 10 ms/lần
-    QTimer timer;
-    QObject::connect(&timer, &QTimer::timeout, [&client](){
-        static int count = 0;
-        client.sendMessage(QString("DATA %1").arg(count++));
-    });
-    timer.start(10);
+    // Regex: thay giá trị của altitude
+    content = std::regex_replace(
+        content,
+        std::regex(R"("altitude"\s*:\s*[-+]?\d*\.?\d+)"),
+        "\"altitude\": " + std::to_string(newAlt)
+    );
 
-    return app.exec();
+    // Ghi lại file (giữ nguyên format, chỉ thay giá trị)
+    std::ofstream out(filePath, std::ios::trunc);
+    if (!out.is_open()) {
+        std::cerr << "Không thể ghi file " << filePath << std::endl;
+        return;
+    }
+    out << content;
+    out.close();
+
+    std::cout << "✅ Đã cập nhật latitude, longitude, altitude trong " << filePath << std::endl;
+}
+
+int main() {
+    replaceJsonFields("data.json", 106.999, 22.1234, 15.5);
+    return 0;
 }
