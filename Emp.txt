@@ -1,58 +1,56 @@
-#include <iostream>
-#include <fstream>
-#include <sstream>
-#include <string>
-#include <regex>
+// constants
+double dt = 1.0 / 25.0; // 0.04s
+double px_per_deg_x = 640.0 / 6.0;
+double px_per_deg_y = 480.0 / 4.5;
+double Kp = 0.8;
+double Kd = 0.1;
+double tau = 0.06; // lead time in seconds (tweak)
+double alpha = 0.3; // EMA factor for omega
 
-void replaceJsonFields(const std::string& filePath,
-                       double newLat, double newLon, double newAlt)
+// state
+double pan_current, tilt_current; // absolute angles
+double x_prev = -1, y_prev = -1;
+double omega_pan_filt = 0.0, omega_tilt_filt = 0.0;
+double last_err_pan = 0.0, last_err_tilt = 0.0;
+
+void onNewFrame(double x_target, double y_target)
 {
-    // Đọc toàn bộ file vào string
-    std::ifstream file(filePath);
-    if (!file.is_open()) {
-        std::cerr << "Không thể mở file " << filePath << std::endl;
-        return;
+    double center_x = 640.0/2.0, center_y = 480.0/2.0;
+    if (x_prev >= 0) {
+        double dx = x_target - x_prev; // pixel
+        double dy = y_prev - y_target; // invert y
+        double delta_deg_pan = dx / px_per_deg_x;
+        double delta_deg_tilt = dy / px_per_deg_y;
+        double omega_pan = delta_deg_pan / dt; // deg/s
+        double omega_tilt = delta_deg_tilt / dt;
+
+        // EMA filter
+        omega_pan_filt = alpha*omega_pan + (1-alpha)*omega_pan_filt;
+        omega_tilt_filt = alpha*omega_tilt + (1-alpha)*omega_tilt_filt;
     }
 
-    std::ostringstream buffer;
-    buffer << file.rdbuf();
-    std::string content = buffer.str();
-    file.close();
+    // predict base setpoint
+    double pan_base  = pan_current  + omega_pan_filt  * tau;
+    double tilt_base = tilt_current + omega_tilt_filt * tau;
 
-    // Regex: thay giá trị của latitude
-    content = std::regex_replace(
-        content,
-        std::regex(R"("latitude"\s*:\s*[-+]?\d*\.?\d+)"),
-        "\"latitude\": " + std::to_string(newLat)
-    );
+    // error in degrees
+    double err_pan  = (x_target - center_x) / px_per_deg_x;
+    double err_tilt = (center_y - y_target) / px_per_deg_y;
 
-    // Regex: thay giá trị của longitude
-    content = std::regex_replace(
-        content,
-        std::regex(R"("longitude"\s*:\s*[-+]?\d*\.?\d+)"),
-        "\"longitude\": " + std::to_string(newLon)
-    );
+    // derivative of error (optional)
+    double err_dot_pan  = (err_pan  - last_err_pan)  / dt;
+    double err_dot_tilt = (err_tilt - last_err_tilt) / dt;
 
-    // Regex: thay giá trị của altitude
-    content = std::regex_replace(
-        content,
-        std::regex(R"("altitude"\s*:\s*[-+]?\d*\.?\d+)"),
-        "\"altitude\": " + std::to_string(newAlt)
-    );
+    // final command
+    double pan_cmd  = pan_base  + Kp*err_pan  + Kd*err_dot_pan;
+    double tilt_cmd = tilt_base + Kp*err_tilt + Kd*err_dot_tilt;
 
-    // Ghi lại file (giữ nguyên format, chỉ thay giá trị)
-    std::ofstream out(filePath, std::ios::trunc);
-    if (!out.is_open()) {
-        std::cerr << "Không thể ghi file " << filePath << std::endl;
-        return;
-    }
-    out << content;
-    out.close();
+    // clamp & send
+    pan_cmd  = clamp(pan_cmd,  PAN_MIN,  PAN_MAX);
+    tilt_cmd = clamp(tilt_cmd, TILT_MIN, TILT_MAX);
+    sendPanTilt(pan_cmd, tilt_cmd);
 
-    std::cout << "✅ Đã cập nhật latitude, longitude, altitude trong " << filePath << std::endl;
-}
-
-int main() {
-    replaceJsonFields("data.json", 106.999, 22.1234, 15.5);
-    return 0;
+    // update
+    x_prev = x_target; y_prev = y_target;
+    last_err_pan = err_pan; last_err_tilt = err_tilt;
 }
