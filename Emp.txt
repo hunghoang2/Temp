@@ -1,39 +1,120 @@
 #include <cmath>
 #include <algorithm>
 
-// Tham số cấu hình
+// ---------------------------
+// Cấu hình hệ thống
+// ---------------------------
+struct CameraConfig {
+    float hfov_deg;   // Horizontal field of view (deg)
+    int width_px;     // Chiều rộng ảnh (pixel)
+    float cx;         // Tâm ảnh (pixel)
+};
+
 struct RampParams {
-    float maxSpeed;   // tốc độ tối đa [deg/s]
-    float maxAccel;   // gia tốc tối đa [deg/s^2]
-    float dt;         // chu kỳ cập nhật [s]
+    float maxSpeed;   // deg/s
+    float maxAccel;   // deg/s^2
+    float dt;         // chu kỳ điều khiển (s)
 };
 
-// Trạng thái ramp
-struct RampState {
-    float position;   // góc hiện tại
-    float velocity;   // vận tốc hiện tại
+// ---------------------------
+// Trạng thái hệ thống
+// ---------------------------
+struct PantiltState {
+    float absAngle;   // góc tuyệt đối hiện tại (deg)
+    float velocity;   // tốc độ hiện tại (deg/s)
+    float absSetpoint; // góc tuyệt đối mục tiêu (deg)
 };
 
-// Hàm cập nhật ramp S-curve
-void rampUpdateSCurve(RampState &state, float target, const RampParams &cfg)
+// ---------------------------
+// Hàm tiện ích
+// ---------------------------
+float pixelToAngleDeg(float x_pixel, const CameraConfig &cam)
 {
-    float error = target - state.position;
+    float dx = x_pixel - cam.cx;
+    return (dx / cam.width_px) * cam.hfov_deg; // gần đúng tuyến tính
+}
 
-    // Tính vận tốc mong muốn (hướng đến đích)
+// ---------------------------
+// Bộ lọc góc (EMA)
+// ---------------------------
+float smoothAngle(float prevFiltered, float newValue, float alpha)
+{
+    return alpha * newValue + (1 - alpha) * prevFiltered;
+}
+
+// ---------------------------
+// Ramp S-curve update
+// ---------------------------
+void rampUpdateSCurve(PantiltState &st, float targetAngleAbs, const RampParams &cfg)
+{
+    float error = targetAngleAbs - st.absAngle;
+
+    // Tính vận tốc mong muốn
     float desiredVel = std::clamp(error / cfg.dt, -cfg.maxSpeed, cfg.maxSpeed);
 
-    // Ramp vận tốc theo gia tốc tối đa
-    float dv = desiredVel - state.velocity;
+    // Giới hạn gia tốc
+    float dv = desiredVel - st.velocity;
     float maxDv = cfg.maxAccel * cfg.dt;
     if (fabs(dv) > maxDv)
-        state.velocity += copysign(maxDv, dv);
+        st.velocity += copysign(maxDv, dv);
     else
-        state.velocity = desiredVel;
+        st.velocity = desiredVel;
 
-    // Giảm tốc nếu sắp vượt đích (năng lượng dừng lại vừa đủ)
-    if ((state.velocity > 0 && error < 0) || (state.velocity < 0 && error > 0))
-        state.velocity = 0;
+    // Nếu vượt qua mục tiêu → dừng lại
+    if ((st.velocity > 0 && error < 0) || (st.velocity < 0 && error > 0))
+        st.velocity = 0;
 
-    // Cập nhật vị trí
-    state.position += state.velocity * cfg.dt;
+    // Cập nhật góc tuyệt đối
+    st.absAngle += st.velocity * cfg.dt;
+}
+
+// ---------------------------
+// Hàm cập nhật chính (gọi mỗi frame)
+// ---------------------------
+void updatePantiltTracking(
+    PantiltState &st,
+    float target_x_px,              // Vị trí mục tiêu trong ảnh
+    const CameraConfig &cam,
+    const RampParams &ramp,
+    float &filteredError,           // lưu góc lỗi đã lọc
+    float alpha                     // hệ số lọc EMA
+)
+{
+    // 1️⃣ Sai số góc so với tâm ảnh (deg)
+    float angleError = pixelToAngleDeg(target_x_px, cam);
+
+    // 2️⃣ Lọc nhiễu từ detection
+    filteredError = smoothAngle(filteredError, angleError, alpha);
+
+    // 3️⃣ Tính góc tuyệt đối mục tiêu
+    float targetAbsAngle = st.absAngle + filteredError;
+
+    // 4️⃣ Cập nhật ramp để quay mượt
+    rampUpdateSCurve(st, targetAbsAngle, ramp);
+
+    // 5️⃣ Cập nhật setpoint (để gửi motor driver)
+    st.absSetpoint = st.absAngle;
+}
+
+// ---------------------------
+// Ví dụ sử dụng
+// ---------------------------
+int main()
+{
+    // Cấu hình camera & ramp
+    CameraConfig cam = {60.0f, 1280, 1280.0f / 2.0f};
+    RampParams ramp = {60.0f, 120.0f, 1.0f / 25.0f}; // 25 Hz
+
+    // Góc tuyệt đối ban đầu biết sẵn (so với chính bắc)
+    PantiltState pan = {0.0f, 0.0f, 0.0f}; // 0° là chính bắc
+    float filteredError = 0.0f;
+
+    // Giả lập tracking
+    float targetPixels[] = {640, 660, 700, 750, 800, 700, 600, 640};
+    for (float x : targetPixels) {
+        updatePantiltTracking(pan, x, cam, ramp, filteredError, 0.3f);
+
+        printf("TargetPx=%.0f | FilterErr=%.2f° | AbsSet=%.2f° | Vel=%.2f°/s\n",
+               x, filteredError, pan.absSetpoint, pan.velocity);
+    }
 }
