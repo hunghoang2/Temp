@@ -1,63 +1,39 @@
-// constants
-double dt = 1.0 / 25.0;
-double px_per_deg_x = IMG_W / FOV_X_DEG;
-double px_per_deg_y = IMG_H / FOV_Y_DEG;
-double alpha = 0.3;      // EMA alpha
-double tau = 0.06;       // lead time
-double Kp = 0.8, Kd = 0.1;
+#include <cmath>
+#include <algorithm>
 
-double az_prev = NAN, el_prev = NAN;
-double omega_pan_f = 0.0, omega_tilt_f = 0.0;
-double last_err_pan = 0.0, last_err_tilt = 0.0;
+// Tham số cấu hình
+struct RampParams {
+    float maxSpeed;   // tốc độ tối đa [deg/s]
+    float maxAccel;   // gia tốc tối đa [deg/s^2]
+    float dt;         // chu kỳ cập nhật [s]
+};
 
-void processFrame(double x_target, double y_target, double pan_current, double tilt_current) {
-    // 1) pixel -> cam angle error
-    double center_x = IMG_W/2.0, center_y = IMG_H/2.0;
-    double err_cam_deg_x = (x_target - center_x) / px_per_deg_x;
-    double err_cam_deg_y = (center_y - y_target) / px_per_deg_y;
+// Trạng thái ramp
+struct RampState {
+    float position;   // góc hiện tại
+    float velocity;   // vận tốc hiện tại
+};
 
-    // 2) absolute bearing
-    double az = pan_current + err_cam_deg_x;
-    double el = tilt_current + err_cam_deg_y;
+// Hàm cập nhật ramp S-curve
+void rampUpdateSCurve(RampState &state, float target, const RampParams &cfg)
+{
+    float error = target - state.position;
 
-    // normalize to [-180,180)
-    az = normalizeAngleDeg(az);
-    el = normalizeAngleDeg(el);
+    // Tính vận tốc mong muốn (hướng đến đích)
+    float desiredVel = std::clamp(error / cfg.dt, -cfg.maxSpeed, cfg.maxSpeed);
 
-    // 3) compute raw omega if have previous
-    if (!isnan(az_prev)) {
-        double delta_az = az - az_prev;
-        // unwrap
-        if (delta_az > 180.0)  delta_az -= 360.0;
-        if (delta_az < -180.0) delta_az += 360.0;
-        double omega_pan_raw  = delta_az / dt;
-        double omega_tilt_raw = (el - el_prev) / dt;
+    // Ramp vận tốc theo gia tốc tối đa
+    float dv = desiredVel - state.velocity;
+    float maxDv = cfg.maxAccel * cfg.dt;
+    if (fabs(dv) > maxDv)
+        state.velocity += copysign(maxDv, dv);
+    else
+        state.velocity = desiredVel;
 
-        // 4) EMA filter
-        omega_pan_f  = alpha * omega_pan_raw  + (1 - alpha) * omega_pan_f;
-        omega_tilt_f = alpha * omega_tilt_raw + (1 - alpha) * omega_tilt_f;
-    }
+    // Giảm tốc nếu sắp vượt đích (năng lượng dừng lại vừa đủ)
+    if ((state.velocity > 0 && error < 0) || (state.velocity < 0 && error > 0))
+        state.velocity = 0;
 
-    // 5) feedforward base
-    double pan_base  = pan_current  + omega_pan_f  * tau;
-    double tilt_base = tilt_current + omega_tilt_f * tau;
-
-    // 6) error and derivative
-    double err_pan = err_cam_deg_x;
-    double err_tilt = err_cam_deg_y;
-    double err_dot_pan = (err_pan - last_err_pan) / dt;
-    double err_dot_tilt= (err_tilt - last_err_tilt)/ dt;
-
-    // 7) final command
-    double pan_cmd  = pan_base  + Kp * err_pan  + Kd * err_dot_pan;
-    double tilt_cmd = tilt_base + Kp * err_tilt + Kd * err_dot_tilt;
-
-    // clamp and send
-    pan_cmd = clamp(pan_cmd, PAN_MIN, PAN_MAX);
-    tilt_cmd = clamp(tilt_cmd, TILT_MIN, TILT_MAX);
-    sendPanTilt(pan_cmd, tilt_cmd);
-
-    // update prevs
-    az_prev = az; el_prev = el;
-    last_err_pan = err_pan; last_err_tilt = err_tilt;
+    // Cập nhật vị trí
+    state.position += state.velocity * cfg.dt;
 }
