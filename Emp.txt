@@ -1,120 +1,102 @@
-#include <cmath>
-#include <algorithm>
+void CameraWorker::start() {
+    if (running_) return;
+    running_ = true;
 
-// ---------------------------
-// Cấu hình hệ thống
-// ---------------------------
-struct CameraConfig {
-    float hfov_deg;   // Horizontal field of view (deg)
-    int width_px;     // Chiều rộng ảnh (pixel)
-    float cx;         // Tâm ảnh (pixel)
-};
-
-struct RampParams {
-    float maxSpeed;   // deg/s
-    float maxAccel;   // deg/s^2
-    float dt;         // chu kỳ điều khiển (s)
-};
-
-// ---------------------------
-// Trạng thái hệ thống
-// ---------------------------
-struct PantiltState {
-    float absAngle;   // góc tuyệt đối hiện tại (deg)
-    float velocity;   // tốc độ hiện tại (deg/s)
-    float absSetpoint; // góc tuyệt đối mục tiêu (deg)
-};
-
-// ---------------------------
-// Hàm tiện ích
-// ---------------------------
-float pixelToAngleDeg(float x_pixel, const CameraConfig &cam)
-{
-    float dx = x_pixel - cam.cx;
-    return (dx / cam.width_px) * cam.hfov_deg; // gần đúng tuyến tính
-}
-
-// ---------------------------
-// Bộ lọc góc (EMA)
-// ---------------------------
-float smoothAngle(float prevFiltered, float newValue, float alpha)
-{
-    return alpha * newValue + (1 - alpha) * prevFiltered;
-}
-
-// ---------------------------
-// Ramp S-curve update
-// ---------------------------
-void rampUpdateSCurve(PantiltState &st, float targetAngleAbs, const RampParams &cfg)
-{
-    float error = targetAngleAbs - st.absAngle;
-
-    // Tính vận tốc mong muốn
-    float desiredVel = std::clamp(error / cfg.dt, -cfg.maxSpeed, cfg.maxSpeed);
-
-    // Giới hạn gia tốc
-    float dv = desiredVel - st.velocity;
-    float maxDv = cfg.maxAccel * cfg.dt;
-    if (fabs(dv) > maxDv)
-        st.velocity += copysign(maxDv, dv);
-    else
-        st.velocity = desiredVel;
-
-    // Nếu vượt qua mục tiêu → dừng lại
-    if ((st.velocity > 0 && error < 0) || (st.velocity < 0 && error > 0))
-        st.velocity = 0;
-
-    // Cập nhật góc tuyệt đối
-    st.absAngle += st.velocity * cfg.dt;
-}
-
-// ---------------------------
-// Hàm cập nhật chính (gọi mỗi frame)
-// ---------------------------
-void updatePantiltTracking(
-    PantiltState &st,
-    float target_x_px,              // Vị trí mục tiêu trong ảnh
-    const CameraConfig &cam,
-    const RampParams &ramp,
-    float &filteredError,           // lưu góc lỗi đã lọc
-    float alpha                     // hệ số lọc EMA
-)
-{
-    // 1️⃣ Sai số góc so với tâm ảnh (deg)
-    float angleError = pixelToAngleDeg(target_x_px, cam);
-
-    // 2️⃣ Lọc nhiễu từ detection
-    filteredError = smoothAngle(filteredError, angleError, alpha);
-
-    // 3️⃣ Tính góc tuyệt đối mục tiêu
-    float targetAbsAngle = st.absAngle + filteredError;
-
-    // 4️⃣ Cập nhật ramp để quay mượt
-    rampUpdateSCurve(st, targetAbsAngle, ramp);
-
-    // 5️⃣ Cập nhật setpoint (để gửi motor driver)
-    st.absSetpoint = st.absAngle;
-}
-
-// ---------------------------
-// Ví dụ sử dụng
-// ---------------------------
-int main()
-{
-    // Cấu hình camera & ramp
-    CameraConfig cam = {60.0f, 1280, 1280.0f / 2.0f};
-    RampParams ramp = {60.0f, 120.0f, 1.0f / 25.0f}; // 25 Hz
-
-    // Góc tuyệt đối ban đầu biết sẵn (so với chính bắc)
-    PantiltState pan = {0.0f, 0.0f, 0.0f}; // 0° là chính bắc
-    float filteredError = 0.0f;
-
-    // Giả lập tracking
-    float targetPixels[] = {640, 660, 700, 750, 800, 700, 600, 640};
-    for (float x : targetPixels) {
-        updatePantiltTracking(pan, x, cam, ramp, filteredError, 0.3f);
-
-        printf("TargetPx=%.0f | FilterErr=%.2f° | AbsSet=%.2f° | Vel=%.2f°/s\n",
-               x, filteredError, pan.absSetpoint, pan.velocity);
+    if (!cap_.open(camIndex_, cv::CAP_ANY)) {
+        emit status("Không mở được camera.");
+        running_ = false;
+        return;
     }
+
+    // Giảm độ trễ đọc
+    cap_.set(cv::CAP_PROP_BUFFERSIZE, 1);
+    // (Tùy cam) cố gắng yêu cầu 25 FPS – không phải thiết bị nào cũng hỗ trợ
+    cap_.set(cv::CAP_PROP_FPS, 25);
+
+    const int target_fps = 25;
+    const std::chrono::milliseconds period(1000 / target_fps); // 40ms
+    auto next_deadline = std::chrono::steady_clock::now() + period;
+
+    bool skipUpdate = false; // nếu quá ngân sách thời gian, bỏ update CSRT khung sau
+
+    while (running_) {
+        auto loop_start = std::chrono::steady_clock::now();
+
+        // ===== Lấy frame mới nhất: drop khung cũ nếu driver đang đẩy nhanh =====
+        cv::Mat frame;
+        // Ít nhất 1 lần read; nếu driver cho phép, dùng grab() để hút đến frame mới nhất
+        // (grab() rẻ hơn retrieve(); retrieve chỉ 1 lần để giải mã)
+        // Một vòng hút ngắn (tối đa ~2ms) để không phá nhịp 40ms.
+        int grabbed = 0;
+        auto grab_deadline = loop_start + std::chrono::milliseconds(2);
+        do {
+            if (!cap_.grab()) break;
+            grabbed++;
+        } while (std::chrono::steady_clock::now() < grab_deadline);
+        if (grabbed == 0) {
+            // Nếu không grab được, thử read truyền thống
+            if (!cap_.read(frame) || frame.empty()) {
+                emit status("Mất khung hình từ camera.");
+                // vẫn tiến tới deadline tiếp theo
+            }
+        } else {
+            if (!cap_.retrieve(frame) || frame.empty()) {
+                emit status("Không retrieve được khung hình.");
+            }
+        }
+
+        if (!frame.empty()) {
+            ensureScaleFactors(frame.cols, frame.rows);
+
+            // ===== Tracking (giữ ngân sách 40ms/khung) =====
+            if (tracking_) {
+                if (tracker_) {
+                    bool doUpdate = !skipUpdate; // nếu khung trước quá giờ, khung này không update để bắt kịp
+                    if (doUpdate) {
+                        bool ok = tracker_->update(frame, bbox_);
+                        if (ok) {
+                            cv::rectangle(frame, bbox_, cv::Scalar(0, 255, 0), 2);
+                        } else {
+                            cv::putText(frame, "Tracking lost", {20, 40}, cv::FONT_HERSHEY_SIMPLEX, 1.0, {0,0,255}, 2);
+                        }
+                    } else {
+                        // Không update, chỉ vẽ bbox cũ
+                        cv::rectangle(frame, bbox_, cv::Scalar(0, 200, 200), 1);
+                    }
+                } else {
+                    emit requestROI();
+                }
+            }
+
+            emit frameReady(matToQImage(frame));
+        }
+
+        // ===== Pacing: giữ đúng 25 fps =====
+        auto now = std::chrono::steady_clock::now();
+        // Nếu xử lý nhanh hơn budget, ngủ đến deadline
+        if (now < next_deadline) {
+            auto sleep_dur = next_deadline - now;
+            // Dùng QThread::msleep cho độ chính xác ms (OS còn tuỳ)
+            auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(sleep_dur).count();
+            if (ms > 0) QThread::msleep(static_cast<unsigned long>(ms));
+            skipUpdate = false; // có thời gian “nghỉ” => khung sau update bình thường
+        } else {
+            // Quá deadline: bỏ ngủ, và khung sau tắt update CSRT để đuổi kịp
+            skipUpdate = true;
+        }
+
+        // Đặt deadline cho khung kế
+        // Dùng bước rời rạc theo period để tránh trôi nhịp
+        do {
+            next_deadline += period;
+        } while (std::chrono::steady_clock::now() > next_deadline + period); 
+        // (tuỳ chọn) nếu bị “trôi” quá xa, kéo về hiện tại + period
+        if (std::chrono::steady_clock::now() - next_deadline > period*5) {
+            next_deadline = std::chrono::steady_clock::now() + period;
+        }
+    }
+
+    if (cap_.isOpened()) cap_.release();
+    tracker_.reset();
+    tracking_ = false;
 }
