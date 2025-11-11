@@ -1,102 +1,165 @@
-void CameraWorker::start() {
-    if (running_) return;
-    running_ = true;
+#pragma once
 
-    if (!cap_.open(camIndex_, cv::CAP_ANY)) {
-        emit status("Không mở được camera.");
-        running_ = false;
-        return;
+#include <QObject>
+#include <QThread>
+#include <QMutex>
+#include <QWaitCondition>
+#include <QQueue>
+#include <QByteArray>
+#include <QString>
+#include <atomic>
+#include <zmq.hpp>
+
+class ZmqClient : public QThread {
+    Q_OBJECT
+public:
+    explicit ZmqClient(QObject *parent = nullptr)
+        : QThread(parent),
+          m_ctx(1),
+          m_socket(nullptr),
+          m_running(false),
+          m_connected(false),
+          m_sndHwm(10000),
+          m_lingerMs(0)
+    {}
+
+    ~ZmqClient() override {
+        stop();
+        wait();
+        closeSocket();
     }
 
-    // Giảm độ trễ đọc
-    cap_.set(cv::CAP_PROP_BUFFERSIZE, 1);
-    // (Tùy cam) cố gắng yêu cầu 25 FPS – không phải thiết bị nào cũng hỗ trợ
-    cap_.set(cv::CAP_PROP_FPS, 25);
+    // --- Config ---
+    void setEndpoint(const QString &ep) {
+        QMutexLocker lock(&m_cfgMtx);
+        m_endpoint = ep;
+    }
+    void setHighWaterMark(int hwm) { m_sndHwm = hwm; }
+    void setLingerMs(int ms) { m_lingerMs = ms; }
 
-    const int target_fps = 25;
-    const std::chrono::milliseconds period(1000 / target_fps); // 40ms
-    auto next_deadline = std::chrono::steady_clock::now() + period;
+public slots:
+    void startClient() {
+        if (isRunning()) return;
+        m_running = true;
+        QThread::start();
+    }
+    void stop() {
+        m_running = false;
+        m_queueNotEmpty.wakeAll();
+    }
 
-    bool skipUpdate = false; // nếu quá ngân sách thời gian, bỏ update CSRT khung sau
-
-    while (running_) {
-        auto loop_start = std::chrono::steady_clock::now();
-
-        // ===== Lấy frame mới nhất: drop khung cũ nếu driver đang đẩy nhanh =====
-        cv::Mat frame;
-        // Ít nhất 1 lần read; nếu driver cho phép, dùng grab() để hút đến frame mới nhất
-        // (grab() rẻ hơn retrieve(); retrieve chỉ 1 lần để giải mã)
-        // Một vòng hút ngắn (tối đa ~2ms) để không phá nhịp 40ms.
-        int grabbed = 0;
-        auto grab_deadline = loop_start + std::chrono::milliseconds(2);
-        do {
-            if (!cap_.grab()) break;
-            grabbed++;
-        } while (std::chrono::steady_clock::now() < grab_deadline);
-        if (grabbed == 0) {
-            // Nếu không grab được, thử read truyền thống
-            if (!cap_.read(frame) || frame.empty()) {
-                emit status("Mất khung hình từ camera.");
-                // vẫn tiến tới deadline tiếp theo
-            }
-        } else {
-            if (!cap_.retrieve(frame) || frame.empty()) {
-                emit status("Không retrieve được khung hình.");
-            }
+    // ✅ Thread-safe — gọi từ thread khác thoải mái
+    void sendMessage(const QByteArray &payload) {
+        {
+            QMutexLocker lock(&m_qMtx);
+            m_queue.enqueue(payload);
         }
+        m_queueNotEmpty.wakeOne();
+    }
 
-        if (!frame.empty()) {
-            ensureScaleFactors(frame.cols, frame.rows);
+signals:
+    void connected();
+    void disconnected();
+    void error(QString msg);
+    void stats(uint64_t sentCount);
 
-            // ===== Tracking (giữ ngân sách 40ms/khung) =====
-            if (tracking_) {
-                if (tracker_) {
-                    bool doUpdate = !skipUpdate; // nếu khung trước quá giờ, khung này không update để bắt kịp
-                    if (doUpdate) {
-                        bool ok = tracker_->update(frame, bbox_);
-                        if (ok) {
-                            cv::rectangle(frame, bbox_, cv::Scalar(0, 255, 0), 2);
-                        } else {
-                            cv::putText(frame, "Tracking lost", {20, 40}, cv::FONT_HERSHEY_SIMPLEX, 1.0, {0,0,255}, 2);
-                        }
-                    } else {
-                        // Không update, chỉ vẽ bbox cũ
-                        cv::rectangle(frame, bbox_, cv::Scalar(0, 200, 200), 1);
+protected:
+    void run() override {
+        uint64_t sent = 0;
+
+        while (m_running) {
+            ensureSocket();
+            if (!m_connected) {
+                msleep(500);
+                continue;
+            }
+
+            while (m_running && m_connected) {
+                QByteArray payload;
+                {
+                    QMutexLocker lock(&m_qMtx);
+                    if (m_queue.isEmpty()) {
+                        m_queueNotEmpty.wait(&m_qMtx, 200);
+                        if (m_queue.isEmpty()) continue;
                     }
-                } else {
-                    emit requestROI();
+                    payload = m_queue.dequeue();
+                }
+
+                try {
+                    zmq::message_t msg(payload.size());
+                    std::memcpy(msg.data(), payload.constData(), payload.size());
+                    auto ok = m_socket->send(msg, zmq::send_flags::dontwait);
+                    if (ok) {
+                        ++sent;
+                        if (sent % 1000 == 0)
+                            emit stats(sent);
+                    }
+                } catch (const zmq::error_t &e) {
+                    emit error(QString("ZMQ send error: %1").arg(e.what()));
+                    handleBroken();
+                    break;
                 }
             }
-
-            emit frameReady(matToQImage(frame));
-        }
-
-        // ===== Pacing: giữ đúng 25 fps =====
-        auto now = std::chrono::steady_clock::now();
-        // Nếu xử lý nhanh hơn budget, ngủ đến deadline
-        if (now < next_deadline) {
-            auto sleep_dur = next_deadline - now;
-            // Dùng QThread::msleep cho độ chính xác ms (OS còn tuỳ)
-            auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(sleep_dur).count();
-            if (ms > 0) QThread::msleep(static_cast<unsigned long>(ms));
-            skipUpdate = false; // có thời gian “nghỉ” => khung sau update bình thường
-        } else {
-            // Quá deadline: bỏ ngủ, và khung sau tắt update CSRT để đuổi kịp
-            skipUpdate = true;
-        }
-
-        // Đặt deadline cho khung kế
-        // Dùng bước rời rạc theo period để tránh trôi nhịp
-        do {
-            next_deadline += period;
-        } while (std::chrono::steady_clock::now() > next_deadline + period); 
-        // (tuỳ chọn) nếu bị “trôi” quá xa, kéo về hiện tại + period
-        if (std::chrono::steady_clock::now() - next_deadline > period*5) {
-            next_deadline = std::chrono::steady_clock::now() + period;
         }
     }
 
-    if (cap_.isOpened()) cap_.release();
-    tracker_.reset();
-    tracking_ = false;
-}
+private:
+    void ensureSocket() {
+        if (m_connected && m_socket) return;
+        closeSocket();
+
+        QString ep;
+        {
+            QMutexLocker lock(&m_cfgMtx);
+            ep = m_endpoint;
+        }
+        if (ep.isEmpty()) {
+            emit error("ZMQ endpoint is empty");
+            msleep(500);
+            return;
+        }
+
+        try {
+            m_socket = new zmq::socket_t(m_ctx, zmq::socket_type::push);
+            m_socket->set(zmq::sockopt::sndhwm, m_sndHwm);
+            m_socket->set(zmq::sockopt::linger, m_lingerMs);
+            m_socket->connect(ep.toStdString());
+
+            m_connected = true;
+            emit connected();
+        } catch (const zmq::error_t &e) {
+            emit error(QString("ZMQ connect failed: %1").arg(e.what()));
+            handleBroken();
+        }
+    }
+
+    void handleBroken() {
+        closeSocket();
+        emit disconnected();
+    }
+
+    void closeSocket() {
+        if (m_socket) {
+            try { m_socket->close(); } catch (...) {}
+            delete m_socket;
+            m_socket = nullptr;
+        }
+        m_connected = false;
+    }
+
+private:
+    zmq::context_t m_ctx;
+    zmq::socket_t *m_socket;
+
+    std::atomic<bool> m_running;
+    std::atomic<bool> m_connected;
+
+    QMutex m_cfgMtx;
+    QString m_endpoint;
+    int m_sndHwm;
+    int m_lingerMs;
+
+    QMutex m_qMtx;
+    QWaitCondition m_queueNotEmpty;
+    QQueue<QByteArray> m_queue;
+};
