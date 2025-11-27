@@ -1,19 +1,33 @@
-// mainwindow.cpp
-#include <QMouseEvent>
-
-bool MainWindow::eventFilter(QObject *obj, QEvent *event)
+bool MainWindow::confirmReset()
 {
-    if (event->type() == QEvent::MouseButtonPress) {
-        auto *mw = qobject_cast<QWidget*>(obj);
-        if (!mw) return false;
-        auto *me = static_cast<QMouseEvent*>(event);
-        QWidget *child = mw->childAt(me->pos());
-        if (child) {
-            qDebug() << "Clicked widget:" << child
-                     << "class:" << child->metaObject()->className()
-                     << "objectName:" << child->objectName()
-                     << "geometry:" << child->geometry();
-        }
+    // 1. Đọc cấu hình xem user đã chọn "không hỏi lại" chưa
+    QSettings st;                             // nhớ include <QSettings>
+    bool skip = st.value("confirmReset/skip", false).toBool();
+    if (skip) {
+        // Tự coi như user đã bấm Đồng ý
+        return true;
     }
-    return false;
+
+    // 2. Tạo message box + checkbox
+    QMessageBox msg(this);
+    msg.setWindowTitle(tr("Xác nhận"));
+    msg.setIcon(QMessageBox::Question);
+    msg.setText(tr("Khởi tạo lại sẽ xóa bảng calib đã đo trước đó.\n"
+                   "Bạn có muốn khởi tạo lại bài đo không?"));
+
+    QPushButton *btnYes  = msg.addButton(tr("Đồng ý"),  QMessageBox::YesRole);
+    QPushButton *btnNo   = msg.addButton(tr("Bỏ qua"),  QMessageBox::NoRole);
+
+    QCheckBox *chk = new QCheckBox(tr("Không hiển thị lại hộp thoại này"), &msg);
+    msg.setCheckBox(chk);   // Qt 5.2+
+
+    msg.exec();
+
+    bool accepted = (msg.clickedButton() == btnYes);
+
+    // 3. Nếu user tick "không hiển thị lại" thì lưu vào settings
+    if (chk->isChecked())
+        st.setValue("confirmReset/skip", true);
+
+    return accepted;
 }
