@@ -1,33 +1,12 @@
-bool MainWindow::confirmReset()
-{
-    // 1. Đọc cấu hình xem user đã chọn "không hỏi lại" chưa
-    QSettings st;                             // nhớ include <QSettings>
-    bool skip = st.value("confirmReset/skip", false).toBool();
-    if (skip) {
-        // Tự coi như user đã bấm Đồng ý
-        return true;
-    }
-
-    // 2. Tạo message box + checkbox
-    QMessageBox msg(this);
-    msg.setWindowTitle(tr("Xác nhận"));
-    msg.setIcon(QMessageBox::Question);
-    msg.setText(tr("Khởi tạo lại sẽ xóa bảng calib đã đo trước đó.\n"
-                   "Bạn có muốn khởi tạo lại bài đo không?"));
-
-    QPushButton *btnYes  = msg.addButton(tr("Đồng ý"),  QMessageBox::YesRole);
-    QPushButton *btnNo   = msg.addButton(tr("Bỏ qua"),  QMessageBox::NoRole);
-
-    QCheckBox *chk = new QCheckBox(tr("Không hiển thị lại hộp thoại này"), &msg);
-    msg.setCheckBox(chk);   // Qt 5.2+
-
-    msg.exec();
-
-    bool accepted = (msg.clickedButton() == btnYes);
-
-    // 3. Nếu user tick "không hiển thị lại" thì lưu vào settings
-    if (chk->isChecked())
-        st.setValue("confirmReset/skip", true);
-
-    return accepted;
-}
+sudo apt update
+sudo apt install -y \
+  build-essential git perl python3 \
+  libgl1-mesa-dev libglu1-mesa-dev \
+  libx11-dev libxext-dev libxrender-dev libxkbcommon-dev \
+  libxkbcommon-x11-dev libfontconfig1-dev libfreetype6-dev \
+  libxcb1-dev libxcb-keysyms1-dev libxcb-render0-dev \
+  libxcb-render-util0-dev libxcb-image0-dev libxcb-shm0-dev \
+  libxcb-icccm4-dev libxcb-sync-dev libxcb-xfixes0-dev \
+  libxcb-shape0-dev libxcb-randr0-dev libxcb-glx0-dev \
+  libxcb-xinerama0-dev libxcb-xinput-dev \
+  libssl-dev libicu-dev libdbus-1-dev
