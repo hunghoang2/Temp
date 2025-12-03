@@ -39,3 +39,27 @@ fi
 
 # 5) Một chút cấu hình cho linker
 rsync -a /etc/ld.so.conf /etc/ld.so.conf.d  $SYSROOT/etc/
+
+# toolchain-aarch64-qt5.cmake
+set(CMAKE_SYSTEM_NAME Linux)
+set(CMAKE_SYSTEM_PROCESSOR aarch64)
+
+# Đường dẫn sysroot (chỉnh lại đúng path của bạn)
+set(CMAKE_SYSROOT "/home/you/sysroots/sysroot-jetson-qt5")
+
+set(CMAKE_C_COMPILER   aarch64-linux-gnu-gcc)
+set(CMAKE_CXX_COMPILER aarch64-linux-gnu-g++)
+
+set(CMAKE_FIND_ROOT_PATH "${CMAKE_SYSROOT}")
+
+set(CMAKE_FIND_ROOT_PATH_MODE_PROGRAM NEVER)
+set(CMAKE_FIND_ROOT_PATH_MODE_LIBRARY ONLY)
+set(CMAKE_FIND_ROOT_PATH_MODE_INCLUDE ONLY)
+set(CMAKE_FIND_ROOT_PATH_MODE_PACKAGE ONLY)
+
+# Nơi CMake config của Qt5 trong sysroot
+list(APPEND CMAKE_PREFIX_PATH
+    "${CMAKE_SYSROOT}/usr/lib/aarch64-linux-gnu/cmake"
+    "${CMAKE_SYSROOT}/usr/lib/qt5"
+)
+
