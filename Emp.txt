@@ -10,3 +10,32 @@ sudo apt install -y \
   libxcb-shape0-dev libxcb-randr0-dev libxcb-glx0-dev \
   libxcb-xinerama0-dev libxcb-xinput-dev \
   libssl-dev libicu-dev libdbus-1-dev
+
+
+SYSROOT=/opt/sysroot-jetson-qt5
+
+# 1) Thư viện hệ thống (glibc, libstdc++, v.v.)
+rsync -a /lib/aarch64-linux-gnu  $SYSROOT/lib/
+rsync -a /usr/lib/aarch64-linux-gnu  $SYSROOT/usr/lib/
+
+# 2) Header (stdlib + headers của Qt)
+rsync -a /usr/include  $SYSROOT/usr/
+
+# 3) Qt directories (tuỳ Ubuntu, thường có các dir này)
+#   - thư viện + plugin + qml:
+if [ -d /usr/lib/qt5 ]; then
+  rsync -a /usr/lib/qt5  $SYSROOT/usr/lib/
+fi
+
+#   - share data, mkspecs, plugins metadata:
+if [ -d /usr/share/qt5 ]; then
+  rsync -a /usr/share/qt5  $SYSROOT/usr/share/
+fi
+
+# 4) CMake config của Qt5 (để CMake trên PC tìm thấy Qt)
+if ls /usr/lib/aarch64-linux-gnu/cmake/Qt5* >/dev/null 2>&1; then
+  rsync -a /usr/lib/aarch64-linux-gnu/cmake  $SYSROOT/usr/lib/aarch64-linux-gnu/
+fi
+
+# 5) Một chút cấu hình cho linker
+rsync -a /etc/ld.so.conf /etc/ld.so.conf.d  $SYSROOT/etc/
