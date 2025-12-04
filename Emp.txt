@@ -1,81 +1,20 @@
-sudo apt update
-sudo apt install -y \
-  build-essential git perl python3 \
-  libgl1-mesa-dev libglu1-mesa-dev \
-  libx11-dev libxext-dev libxrender-dev libxkbcommon-dev \
-  libxkbcommon-x11-dev libfontconfig1-dev libfreetype6-dev \
-  libxcb1-dev libxcb-keysyms1-dev libxcb-render0-dev \
-  libxcb-render-util0-dev libxcb-image0-dev libxcb-shm0-dev \
-  libxcb-icccm4-dev libxcb-sync-dev libxcb-xfixes0-dev \
-  libxcb-shape0-dev libxcb-randr0-dev libxcb-glx0-dev \
-  libxcb-xinerama0-dev libxcb-xinput-dev \
-  libssl-dev libicu-dev libdbus-1-dev
+MAKEFILE_GENERATOR      = UNIX
+QMAKE_PLATFORM          = linux
+QMAKE_COMPILER          = gcc
 
+QMAKE_CC                = aarch64-linux-gnu-gcc
+QMAKE_CXX               = aarch64-linux-gnu-g++
+QMAKE_LINK              = aarch64-linux-gnu-g++
+QMAKE_AR                = aarch64-linux-gnu-ar cqs
+QMAKE_OBJCOPY           = aarch64-linux-gnu-objcopy
+QMAKE_STRIP             = aarch64-linux-gnu-strip
 
-SYSROOT=/opt/sysroot-jetson-qt5
+# Sysroot ARM
+QMAKE_SYSROOT           = /home/rt/sysroot-aarch64-qt5
 
-# 1) Thư viện hệ thống (glibc, libstdc++, v.v.)
-rsync -a /lib/aarch64-linux-gnu  $SYSROOT/lib/
-rsync -a /usr/lib/aarch64-linux-gnu  $SYSROOT/usr/lib/
+QMAKE_INCDIR            = $$QMAKE_SYSROOT/usr/include
+QMAKE_LIBDIR            = $$QMAKE_SYSROOT/usr/lib/aarch64-linux-gnu
 
-# 2) Header (stdlib + headers của Qt)
-rsync -a /usr/include  $SYSROOT/usr/
-
-# 3) Qt directories (tuỳ Ubuntu, thường có các dir này)
-#   - thư viện + plugin + qml:
-if [ -d /usr/lib/qt5 ]; then
-  rsync -a /usr/lib/qt5  $SYSROOT/usr/lib/
-fi
-
-#   - share data, mkspecs, plugins metadata:
-if [ -d /usr/share/qt5 ]; then
-  rsync -a /usr/share/qt5  $SYSROOT/usr/share/
-fi
-
-# 4) CMake config của Qt5 (để CMake trên PC tìm thấy Qt)
-if ls /usr/lib/aarch64-linux-gnu/cmake/Qt5* >/dev/null 2>&1; then
-  rsync -a /usr/lib/aarch64-linux-gnu/cmake  $SYSROOT/usr/lib/aarch64-linux-gnu/
-fi
-
-# 5) Một chút cấu hình cho linker
-rsync -a /etc/ld.so.conf /etc/ld.so.conf.d  $SYSROOT/etc/
-
-# toolchain-aarch64-qt5.cmake
-set(CMAKE_SYSTEM_NAME Linux)
-set(CMAKE_SYSTEM_PROCESSOR aarch64)
-
-# Đường dẫn sysroot (chỉnh lại đúng path của bạn)
-set(CMAKE_SYSROOT "/home/you/sysroots/sysroot-jetson-qt5")
-
-set(CMAKE_C_COMPILER   aarch64-linux-gnu-gcc)
-set(CMAKE_CXX_COMPILER aarch64-linux-gnu-g++)
-
-set(CMAKE_FIND_ROOT_PATH "${CMAKE_SYSROOT}")
-
-set(CMAKE_FIND_ROOT_PATH_MODE_PROGRAM NEVER)
-set(CMAKE_FIND_ROOT_PATH_MODE_LIBRARY ONLY)
-set(CMAKE_FIND_ROOT_PATH_MODE_INCLUDE ONLY)
-set(CMAKE_FIND_ROOT_PATH_MODE_PACKAGE ONLY)
-
-# Nơi CMake config của Qt5 trong sysroot
-list(APPEND CMAKE_PREFIX_PATH
-    "${CMAKE_SYSROOT}/usr/lib/aarch64-linux-gnu/cmake"
-    "${CMAKE_SYSROOT}/usr/lib/qt5"
-)
-
-cd /home/rt/Documents/Qt/test_arm
-mkdir build_arm && cd build_arm
-
-/usr/lib/qt5/bin/qmake ../test_arm.pro \
-  "QMAKE_CC=${CROSS}gcc" \
-  "QMAKE_CXX=${CROSS}g++" \
-  "QMAKE_LINK=${CROSS}g++" \
-  "QMAKE_OBJCOPY=${CROSS}objcopy" \
-  "QMAKE_STRIP=${CROSS}strip" \
-  "QMAKE_CFLAGS+=--sysroot=$SYSROOT" \
-  "QMAKE_CXXFLAGS+=--sysroot=$SYSROOT" \
-  "QMAKE_LFLAGS+=--sysroot=$SYSROOT" \
-  "QMAKE_INCDIR+=${SYSROOT}/usr/include" \
-  "QMAKE_LIBDIR+=${SYSROOT}/usr/lib/aarch64-linux-gnu"
-
-make -j$(nproc)
+QMAKE_CFLAGS           += --sysroot=$$QMAKE_SYSROOT
+QMAKE_CXXFLAGS         += --sysroot=$$QMAKE_SYSROOT
+QMAKE_LFLAGS           += --sysroot=$$QMAKE_SYSROOT
