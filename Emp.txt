@@ -63,3 +63,19 @@ list(APPEND CMAKE_PREFIX_PATH
     "${CMAKE_SYSROOT}/usr/lib/qt5"
 )
 
+cd /home/rt/Documents/Qt/test_arm
+mkdir build_arm && cd build_arm
+
+/usr/lib/qt5/bin/qmake ../test_arm.pro \
+  "QMAKE_CC=${CROSS}gcc" \
+  "QMAKE_CXX=${CROSS}g++" \
+  "QMAKE_LINK=${CROSS}g++" \
+  "QMAKE_OBJCOPY=${CROSS}objcopy" \
+  "QMAKE_STRIP=${CROSS}strip" \
+  "QMAKE_CFLAGS+=--sysroot=$SYSROOT" \
+  "QMAKE_CXXFLAGS+=--sysroot=$SYSROOT" \
+  "QMAKE_LFLAGS+=--sysroot=$SYSROOT" \
+  "QMAKE_INCDIR+=${SYSROOT}/usr/include" \
+  "QMAKE_LIBDIR+=${SYSROOT}/usr/lib/aarch64-linux-gnu"
+
+make -j$(nproc)
