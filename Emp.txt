@@ -1,1 +1,44 @@
-https://files.pythonhosted.org/packages/dc/6d/cfe3c0fcc5e477df242b98bfe186a4c34357b4847e87ecaef04507332dab/flask-3.1.2.tar.gz
+#include <iostream>
+#include <fcntl.h>
+#include <unistd.h>
+#include <string.h>
+#include <stdint.h>
+#include <sys/ioctl.h>
+
+extern "C" {
+#include <revpi/picontroldev.h>
+}
+
+int main() {
+    int fd = open("/dev/piControl0", O_RDWR);
+    if (fd < 0) {
+        std::cerr << "Cannot open piControl device\n";
+        return -1;
+    }
+
+    // AI_1 trên RevPi AIO thường offset = 0 (tuỳ config)
+    PCData data;
+    memset(&data, 0, sizeof(data));
+
+    data.offset = 0;      // offset của AI_1 trong process image
+    data.length = 2;      // data 2 byte (0…32767)
+    data.pData = new uint8_t[2];
+
+    if (ioctl(fd, KB_GET_VALUE, &data) < 0) {
+        std::cerr << "Error reading from process image\n";
+        close(fd);
+        return -1;
+    }
+
+    int value = data.pData[0] | (data.pData[1] << 8);
+    std::cout << "AI_1 Raw Value = " << value << std::endl;
+
+    // Chuyển đổi raw → mV → V:
+    float voltage = (value / 32767.0f) * 10000.0f; // ví dụ 0–10V
+    std::cout << "Voltage = " << voltage << " mV\n";
+
+    close(fd);
+    delete[] data.pData;
+
+    return 0;
+}
