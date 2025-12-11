@@ -5,13 +5,14 @@
 #include <cctype>
 #include <cstdio>   // FILE, popen, pclose
 
-// Hàm thực thi lệnh shell và lấy toàn bộ output (stdout + stderr)
+// Thực thi lệnh shell và lấy toàn bộ output (stdout)
 std::string execCommand(const std::string& cmd) {
     std::array<char, 256> buffer{};
     std::string result;
 
-    // 2>&1: gộp stderr vào stdout để nếu piTest báo lỗi cũng đọc được
-    FILE* pipe = popen((cmd + " 2>&1").c_str(), "r");
+    // KHÔNG dùng (cmd + " 2>&1").c_str() nữa, tránh pointer rác
+    std::string fullCmd = cmd;          // nếu muốn gom stderr: fullCmd = cmd + " 2>&1";
+    FILE* pipe = popen(fullCmd.c_str(), "r");
     if (!pipe) {
         std::perror("popen failed");
         return "";
@@ -27,9 +28,10 @@ std::string execCommand(const std::string& cmd) {
     return result;
 }
 
-// Hàm đọc analog input với piTest -q
+// Đọc analog input qua piTest -q
 // channelName ví dụ: "AnalogInput_4"
 int readAnalogInput(const std::string& channelName) {
+    // Nếu cần full path thì sửa thành "/usr/bin/piTest"
     std::string cmd = "piTest -q -r " + channelName;
 
     std::cerr << "[DEBUG] Running command: " << cmd << std::endl;
@@ -42,9 +44,9 @@ int readAnalogInput(const std::string& channelName) {
 
     std::cerr << "[DEBUG] Raw piTest output: '" << out << "'" << std::endl;
 
-    // Bỏ hết \n, \r, space...
+    // Xóa toàn bộ khoảng trắng (\n, \r, space, tab...)
     out.erase(std::remove_if(out.begin(), out.end(),
-                             [](unsigned char c){ return std::isspace(c); }),
+                             [](unsigned char c) { return std::isspace(c); }),
               out.end());
 
     std::cerr << "[DEBUG] Trimmed output: '" << out << "'" << std::endl;
