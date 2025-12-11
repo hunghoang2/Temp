@@ -1,87 +1,31 @@
-#include <iostream>
-#include <string>
-#include <array>
-#include <algorithm>
-#include <cctype>
-#include <cstdio>   // FILE, popen, pclose
+#!/usr/bin/env python3
+import revpimodio2
+from flask import Flask, jsonify
 
-// Thực thi lệnh shell và lấy toàn bộ output (stdout)
-std::string execCommand(const std::string& cmd) {
-    std::array<char, 256> buffer{};
-    std::string result;
+# Khởi tạo RevPi, autorefresh để thư viện tự cập nhật giá trị IO
+rpi = revpimodio2.RevPiModIO(autorefresh=True)
 
-    // KHÔNG dùng (cmd + " 2>&1").c_str() nữa, tránh pointer rác
-    std::string fullCmd = cmd;          // nếu muốn gom stderr: fullCmd = cmd + " 2>&1";
-    FILE* pipe = popen(fullCmd.c_str(), "r");
-    if (!pipe) {
-        std::perror("popen failed");
-        return "";
-    }
+app = Flask(__name__)
 
-    while (fgets(buffer.data(), buffer.size(), pipe) != nullptr) {
-        result += buffer.data();
-    }
+@app.route("/api/analog/4", methods=["GET"])
+def get_analog_input_4():
+    """
+    Trả về giá trị của kênh AnalogInput_4 dạng JSON
+    """
+    try:
+        value = rpi.io.AnalogInput_4.value     # đọc raw value
+        # Nếu bạn có scale sang Volt hoặc mA thì tính thêm ở đây
+        return jsonify({
+            "channel": "AnalogInput_4",
+            "value": value
+        })
+    except AttributeError:
+        # Trường hợp PiCtory không có tên IO này
+        return jsonify({
+            "error": "IO 'AnalogInput_4' không tồn tại. Kiểm tra lại tên trong PiCtory."
+        }), 500
 
-    int rc = pclose(pipe);
-    std::cerr << "[DEBUG] piTest exit code: " << rc << std::endl;
 
-    return result;
-}
-
-// Đọc analog input qua piTest -q
-// channelName ví dụ: "AnalogInput_4"
-int readAnalogInput(const std::string& channelName) {
-    // Nếu cần full path thì sửa thành "/usr/bin/piTest"
-    std::string cmd = "piTest -q -r " + channelName;
-
-    std::cerr << "[DEBUG] Running command: " << cmd << std::endl;
-    std::string out = execCommand(cmd);
-
-    if (out.empty()) {
-        std::cerr << "[ERROR] Empty output from piTest" << std::endl;
-        return -1;
-    }
-
-    std::cerr << "[DEBUG] Raw piTest output: '" << out << "'" << std::endl;
-
-    // Xóa toàn bộ khoảng trắng (\n, \r, space, tab...)
-    out.erase(std::remove_if(out.begin(), out.end(),
-                             [](unsigned char c) { return std::isspace(c); }),
-              out.end());
-
-    std::cerr << "[DEBUG] Trimmed output: '" << out << "'" << std::endl;
-
-    try {
-        int value = std::stoi(out);
-        return value;
-    } catch (...) {
-        std::cerr << "[ERROR] Cannot parse int from: '" << out << "'" << std::endl;
-        return -1;
-    }
-}
-
-int main(int argc, char* argv[]) {
-    // Tắt buffer để log ra ngay lập tức
-    setvbuf(stdout, nullptr, _IONBF, 0);
-    setvbuf(stderr, nullptr, _IONBF, 0);
-
-    std::cout << "RevPi AnalogInput reader start\n";
-
-    // Mặc định đọc AnalogInput_4 nếu không truyền tham số
-    std::string channel = "AnalogInput_4";
-    if (argc >= 2) {
-        channel = argv[1];
-    }
-
-    std::cout << "Reading channel: " << channel << std::endl;
-
-    int raw = readAnalogInput(channel);
-
-    if (raw >= 0) {
-        std::cout << "Raw value of " << channel << " = " << raw << std::endl;
-    } else {
-        std::cout << "Failed to read analog input.\n";
-    }
-
-    return 0;
-}
+if __name__ == "__main__":
+    # Chạy API trên mọi interface, port 5000
+    app.run(host="0.0.0.0", port=5000)
