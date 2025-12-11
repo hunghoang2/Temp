@@ -1,31 +1,23 @@
-[Unit]
-Description=Qt Kiosk App
-After=plymouth-quit.service
-Wants=plymouth-quit.service
+#include <iostream>
+#include <string>
+#include <array>
+#include <memory>
 
-[Service]
-Type=simple
-User=pi
-WorkingDirectory=/home/pi/Desktop
-Environment=QT_QPA_PLATFORM=eglfs
-ExecStart=/home/pi/Desktop/test_arm
-Restart=always
-RestartSec=2
+std::string execCommand(const std::string& cmd) {
+    std::array<char, 128> buffer{};
+    std::string result;
 
-[Install]
-WantedBy=multi-user.target
+    std::unique_ptr<FILE, decltype(&pclose)> pipe(popen(cmd.c_str(), "r"), pclose);
+    if (!pipe) {
+        return "";
+    }
+
+    while (fgets(buffer.data(), buffer.size(), pipe.get()) != nullptr) {
+        result += buffer.data();
+    }
+
+    return result;
+}
 
 
 
-[Unit]
-Description=Early Splash Screen
-DefaultDependencies=no
-After=local-fs.target
-
-[Service]
-ExecStart=/usr/bin/fbi -T 1 -noverbose -a /home/pi/splash.png
-StandardInput=tty
-StandardOutput=tty
-
-[Install]
-WantedBy=sysinit.target
