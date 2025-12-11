@@ -2,13 +2,19 @@
 #include <string>
 #include <array>
 #include <memory>
+#include <algorithm>
+#include <cctype>
 
+// ---------------------------
+// Hàm thực thi lệnh piTest
+// ---------------------------
 std::string execCommand(const std::string& cmd) {
-    std::array<char, 128> buffer{};
+    std::array<char, 256> buffer{};
     std::string result;
 
     std::unique_ptr<FILE, decltype(&pclose)> pipe(popen(cmd.c_str(), "r"), pclose);
     if (!pipe) {
+        std::cerr << "Error: Cannot execute command\n";
         return "";
     }
 
@@ -19,5 +25,50 @@ std::string execCommand(const std::string& cmd) {
     return result;
 }
 
+// ---------------------------
+// Hàm đọc giá trị Analog Input
+// channelName = "AnalogInput_4"
+// ---------------------------
+int readAnalogInput(const std::string& channelName) {
+    std::string cmd = "piTest -q -r " + channelName;
 
+    std::string out = execCommand(cmd);
+    if (out.empty()) {
+        std::cerr << "Error: Empty output from piTest\n";
+        return -1;
+    }
 
+    // Loại bỏ tất cả ký tự whitespace (\r \n ' ')
+    out.erase(std::remove_if(out.begin(), out.end(),
+                             [](unsigned char c){ return std::isspace(c); }),
+              out.end());
+
+    try {
+        return std::stoi(out);
+    } catch (...) {
+        std::cerr << "Error: Cannot parse integer from output: " << out << "\n";
+        return -1;
+    }
+}
+
+// ---------------------------
+// MAIN
+// ---------------------------
+int main(int argc, char* argv[]) {
+    if (argc < 2) {
+        std::cout << "Usage: ./read_ai <AnalogInput_X>\n";
+        std::cout << "Example: ./read_ai AnalogInput_4\n";
+        return 1;
+    }
+
+    std::string channel = argv[1];
+    int raw = readAnalogInput(channel);
+
+    if (raw >= 0) {
+        std::cout << "Raw value of " << channel << " = " << raw << std::endl;
+    } else {
+        std::cout << "Failed to read analog input.\n";
+    }
+
+    return 0;
+}
