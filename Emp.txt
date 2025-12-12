@@ -1,44 +1,63 @@
-#include <iostream>
-#include <fcntl.h>
-#include <unistd.h>
-#include <string.h>
-#include <stdint.h>
-#include <sys/ioctl.h>
+// hằng số
+const float FOV_X_DEG = 6.0f;
+const float FOV_Y_DEG = 4.5f;
+const int   RES_X     = 640;
+const int   RES_Y     = 480;
+const float DEG_PER_PX_X = FOV_X_DEG / RES_X;   // 0.009375
+const float DEG_PER_PX_Y = FOV_Y_DEG / RES_Y;   // 0.009375
+const float FPS = 25.0f;
+const float T   = 1.0f / FPS;
+const float T_DELAY = 1.0f * T;   // dự đoán trước 1 frame
 
-extern "C" {
-#include <revpi/picontroldev.h>
-}
+const float Kp_pan   = 1.0f;  // chỉnh thực nghiệm
+const float Kp_tilt  = 1.0f;
+const float Kv_pan   = 1.0f;
+const float Kv_tilt  = 1.0f;
 
-int main() {
-    int fd = open("/dev/piControl0", O_RDWR);
-    if (fd < 0) {
-        std::cerr << "Cannot open piControl device\n";
-        return -1;
-    }
+// trạng thái lưu giữa các frame
+float u_prev = 320.0f;
+float v_prev = 240.0f;
 
-    // AI_1 trên RevPi AIO thường offset = 0 (tuỳ config)
-    PCData data;
-    memset(&data, 0, sizeof(data));
+void update_control(float u, float v, float pan_current, float tilt_current)
+{
+    // 1. Sai lệch pixel
+    float ex_px = u - 320.0f;
+    float ey_px = v - 240.0f;
 
-    data.offset = 0;      // offset của AI_1 trong process image
-    data.length = 2;      // data 2 byte (0…32767)
-    data.pData = new uint8_t[2];
+    // 2. Sai lệch góc
+    float ex_deg = ex_px * DEG_PER_PX_X;
+    float ey_deg = ey_px * DEG_PER_PX_Y;
 
-    if (ioctl(fd, KB_GET_VALUE, &data) < 0) {
-        std::cerr << "Error reading from process image\n";
-        close(fd);
-        return -1;
-    }
+    // 3. Vận tốc góc mục tiêu (feed-forward)
+    float du_px = u - u_prev;
+    float dv_px = v - v_prev;
 
-    int value = data.pData[0] | (data.pData[1] << 8);
-    std::cout << "AI_1 Raw Value = " << value << std::endl;
+    float vx_px = du_px * FPS;  // pixel/s
+    float vy_px = dv_px * FPS;
 
-    // Chuyển đổi raw → mV → V:
-    float voltage = (value / 32767.0f) * 10000.0f; // ví dụ 0–10V
-    std::cout << "Voltage = " << voltage << " mV\n";
+    float omega_x = vx_px * DEG_PER_PX_X; // deg/s
+    float omega_y = vy_px * DEG_PER_PX_Y;
 
-    close(fd);
-    delete[] data.pData;
+    // 4a. Nếu điều khiển theo tốc độ:
+    float omega_pan_cmd  = Kp_pan * ex_deg  + Kv_pan * omega_x;
+    float omega_tilt_cmd = Kp_tilt * ey_deg + Kv_tilt * omega_y;
 
-    return 0;
+    send_pan_velocity_command(omega_pan_cmd);
+    send_tilt_velocity_command(omega_tilt_cmd);
+
+    // --- HOẶC ---
+
+    // 4b. Nếu điều khiển theo góc đặt + dự đoán
+    float pan_ff  = omega_x * T_DELAY;
+    float tilt_ff = omega_y * T_DELAY;
+
+    float pan_cmd  = pan_current  + ex_deg  + pan_ff;
+    float tilt_cmd = tilt_current + ey_deg  + tilt_ff;
+
+    send_pan_angle_command(pan_cmd);
+    send_tilt_angle_command(tilt_cmd);
+
+    // 5. Cập nhật trạng thái
+    u_prev = u;
+    v_prev = v;
 }
