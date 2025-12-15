@@ -1,63 +1,69 @@
-// hằng số
-const float FOV_X_DEG = 6.0f;
-const float FOV_Y_DEG = 4.5f;
-const int   RES_X     = 640;
-const int   RES_Y     = 480;
-const float DEG_PER_PX_X = FOV_X_DEG / RES_X;   // 0.009375
-const float DEG_PER_PX_Y = FOV_Y_DEG / RES_Y;   // 0.009375
-const float FPS = 25.0f;
-const float T   = 1.0f / FPS;
-const float T_DELAY = 1.0f * T;   // dự đoán trước 1 frame
+// ---- Tunables (gợi ý) ----
+const float e_small = 0.03f;   // deg  (~3px)
+const float e_large = 0.30f;   // deg  (~32px)
 
-const float Kp_pan   = 1.0f;  // chỉnh thực nghiệm
-const float Kp_tilt  = 1.0f;
-const float Kv_pan   = 1.0f;
-const float Kv_tilt  = 1.0f;
+const float Kp_min = 0.2f;
+const float Kp_max = 1.2f;
 
-// trạng thái lưu giữa các frame
-float u_prev = 320.0f;
-float v_prev = 240.0f;
+const float w_low  = 5.0f;     // deg/s
+const float w_high = 40.0f;    // deg/s
 
-void update_control(float u, float v, float pan_current, float tilt_current)
+const float Kv_min = 0.5f;
+const float Kv_max = 1.6f;
+
+const float a_soft = 80.0f;    // deg/s^2
+const float a_hard = 250.0f;   // deg/s^2
+
+const float alpha_slow = 0.9f;
+const float alpha_fast = 0.6f;
+
+const float OMEGA_MAX = 60.0f; // deg/s (theo cơ khí)
+const float A_MAX     = 400.0f; // deg/s^2 (theo cơ khí)
+
+// ---- State ----
+static float az_sp;
+static float omega_tgt_f = 0;
+static float omega_tgt_prev = 0;
+static float omega_cmd_prev = 0;
+
+// helpers: clamp(), wrap_360()
+
+void update_pan_adaptive(float e_deg, float omega_tgt, float conf, float dt)
 {
-    // 1. Sai lệch pixel
-    float ex_px = u - 320.0f;
-    float ey_px = v - 240.0f;
+    // 1) speed scale
+    float sw = clamp((fabsf(omega_tgt) - w_low) / (w_high - w_low), 0.0f, 1.0f);
 
-    // 2. Sai lệch góc
-    float ex_deg = ex_px * DEG_PER_PX_X;
-    float ey_deg = ey_px * DEG_PER_PX_Y;
+    // 2) adaptive filter for omega_tgt
+    float alpha = alpha_slow - (alpha_slow - alpha_fast) * sw;
+    omega_tgt_f = alpha * omega_tgt_f + (1 - alpha) * omega_tgt;
 
-    // 3. Vận tốc góc mục tiêu (feed-forward)
-    float du_px = u - u_prev;
-    float dv_px = v - v_prev;
+    // 3) target angular accel (for direction-change gating)
+    float a_tgt = (omega_tgt - omega_tgt_prev) / fmaxf(dt, 1e-3f);
+    omega_tgt_prev = omega_tgt;
 
-    float vx_px = du_px * FPS;  // pixel/s
-    float vy_px = dv_px * FPS;
+    float ga = 1.0f - clamp((fabsf(a_tgt) - a_soft) / (a_hard - a_soft), 0.0f, 1.0f);
+    float g  = ga * clamp(conf, 0.0f, 1.0f);
 
-    float omega_x = vx_px * DEG_PER_PX_X; // deg/s
-    float omega_y = vy_px * DEG_PER_PX_Y;
+    // 4) adaptive Kp by error magnitude
+    float se = clamp((fabsf(e_deg) - e_small) / (e_large - e_small), 0.0f, 1.0f);
+    float Kp = Kp_min + (Kp_max - Kp_min) * se;
 
-    // 4a. Nếu điều khiển theo tốc độ:
-    float omega_pan_cmd  = Kp_pan * ex_deg  + Kv_pan * omega_x;
-    float omega_tilt_cmd = Kp_tilt * ey_deg + Kv_tilt * omega_y;
+    // 5) adaptive Kv by speed
+    float Kv = Kv_min + (Kv_max - Kv_min) * sw;
 
-    send_pan_velocity_command(omega_pan_cmd);
-    send_tilt_velocity_command(omega_tilt_cmd);
+    // 6) rate-control
+    float omega_cmd = Kp * e_deg + (Kv * g) * omega_tgt_f;
 
-    // --- HOẶC ---
+    // 7) clamp speed
+    omega_cmd = clamp(omega_cmd, -OMEGA_MAX, +OMEGA_MAX);
 
-    // 4b. Nếu điều khiển theo góc đặt + dự đoán
-    float pan_ff  = omega_x * T_DELAY;
-    float tilt_ff = omega_y * T_DELAY;
+    // 8) clamp accel (smooth command)
+    float dw = A_MAX * dt;
+    omega_cmd = clamp(omega_cmd, omega_cmd_prev - dw, omega_cmd_prev + dw);
+    omega_cmd_prev = omega_cmd;
 
-    float pan_cmd  = pan_current  + ex_deg  + pan_ff;
-    float tilt_cmd = tilt_current + ey_deg  + tilt_ff;
+    // 9) integrate to absolute setpoint
+    az_sp = wrap_360(az_sp + omega_cmd * dt);
 
-    send_pan_angle_command(pan_cmd);
-    send_tilt_angle_command(tilt_cmd);
-
-    // 5. Cập nhật trạng thái
-    u_prev = u;
-    v_prev = v;
+    send_pan_absolute(az_sp);
 }
