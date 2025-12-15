@@ -1,69 +1,115 @@
-// ---- Tunables (gợi ý) ----
-const float e_small = 0.03f;   // deg  (~3px)
-const float e_large = 0.30f;   // deg  (~32px)
+// ---- helpers ----
+float wrap360(float a){
+  while (a >= 360.0f) a -= 360.0f;
+  while (a <  0.0f)   a += 360.0f;
+  return a;
+}
+float angDiffDeg(float target, float current){
+  float d = target - current;
+  while (d >= 180.0f) d -= 360.0f;
+  while (d < -180.0f) d += 360.0f;
+  return d; // [-180, 180)
+}
+float clampf(float x, float lo, float hi){
+  if (x < lo) return lo;
+  if (x > hi) return hi;
+  return x;
+}
 
-const float Kp_min = 0.2f;
-const float Kp_max = 1.2f;
+// ---- constants (mechanical limits) ----
+const float W_MAX = 60.0f;   // deg/s
+const float A_MAX = 60.0f;   // deg/s^2
 
-const float w_low  = 5.0f;     // deg/s
-const float w_high = 40.0f;    // deg/s
+// camera geometry
+const float DEG_PER_PX_X = 6.0f / 640.0f;   // 0.009375
 
-const float Kv_min = 0.5f;
-const float Kv_max = 1.6f;
+// ---- adaptive thresholds (gợi ý ban đầu) ----
+// speed thresholds (deg/s)
+const float W_LOW  = 2.0f;   // coi như chậm/đứng yên
+const float W_HIGH = 20.0f;  // coi như nhanh
 
-const float a_soft = 80.0f;    // deg/s^2
-const float a_hard = 250.0f;   // deg/s^2
+// accel thresholds (deg/s^2) for direction-change gating
+const float A_SOFT = 80.0f;
+const float A_HARD = 250.0f;
 
-const float alpha_slow = 0.9f;
-const float alpha_fast = 0.6f;
+// error thresholds (deg)
+const float E_SMALL = 2.0f * DEG_PER_PX_X;  // ~2 px
+const float E_LARGE = 0.30f;                // ~32 px
 
-const float OMEGA_MAX = 60.0f; // deg/s (theo cơ khí)
-const float A_MAX     = 400.0f; // deg/s^2 (theo cơ khí)
+// gains ranges
+const float KP_MIN = 0.6f;
+const float KP_MAX = 1.6f;
 
-// ---- State ----
-static float az_sp;
-static float omega_tgt_f = 0;
-static float omega_tgt_prev = 0;
-static float omega_cmd_prev = 0;
+const float KFF_MIN = 0.6f;
+const float KFF_MAX = 1.6f;
 
-// helpers: clamp(), wrap_360()
+// prediction horizon range (s)
+const float TPRED_MIN = 0.04f;
+const float TPRED_MAX = 0.10f;
 
-void update_pan_adaptive(float e_deg, float omega_tgt, float conf, float dt)
+// filter alpha range (bigger = lọc mạnh hơn)
+const float ALPHA_SLOW = 0.90f;
+const float ALPHA_FAST = 0.60f;
+
+// ---- state ----
+static float az_cmd;          // setpoint đã gửi (0..360)
+static float w_cmd_prev = 0;  // tốc độ setpoint trước
+
+static float u_prev = 320.0f;
+static float w_tgt_prev = 0;  // omega_tgt trước
+static float w_tgt_f = 0;     // omega_tgt filtered
+
+// conf: 0..1 nếu có, không có thì luôn 1
+void update_pan_adaptive(float dt, float u, float conf)
 {
-    // 1) speed scale
-    float sw = clamp((fabsf(omega_tgt) - w_low) / (w_high - w_low), 0.0f, 1.0f);
+  // 1) image error (deg)
+  float e = (u - 320.0f) * DEG_PER_PX_X;
 
-    // 2) adaptive filter for omega_tgt
-    float alpha = alpha_slow - (alpha_slow - alpha_fast) * sw;
-    omega_tgt_f = alpha * omega_tgt_f + (1 - alpha) * omega_tgt;
+  // deadband tránh rung khi đứng yên
+  if (fabsf(e) < E_SMALL) e = 0;
 
-    // 3) target angular accel (for direction-change gating)
-    float a_tgt = (omega_tgt - omega_tgt_prev) / fmaxf(dt, 1e-3f);
-    omega_tgt_prev = omega_tgt;
+  // 2) target angular rate from image (deg/s)
+  float w_tgt = ((u - u_prev) / dt) * DEG_PER_PX_X;
+  u_prev = u;
 
-    float ga = 1.0f - clamp((fabsf(a_tgt) - a_soft) / (a_hard - a_soft), 0.0f, 1.0f);
-    float g  = ga * clamp(conf, 0.0f, 1.0f);
+  // 3) speed scale sw in [0..1]
+  float sw = clampf((fabsf(w_tgt) - W_LOW) / (W_HIGH - W_LOW), 0.0f, 1.0f);
 
-    // 4) adaptive Kp by error magnitude
-    float se = clamp((fabsf(e_deg) - e_small) / (e_large - e_small), 0.0f, 1.0f);
-    float Kp = Kp_min + (Kp_max - Kp_min) * se;
+  // 4) adaptive filter for w_tgt (slow -> filter more)
+  float alpha = ALPHA_SLOW - (ALPHA_SLOW - ALPHA_FAST) * sw;
+  w_tgt_f = alpha * w_tgt_f + (1.0f - alpha) * w_tgt;
 
-    // 5) adaptive Kv by speed
-    float Kv = Kv_min + (Kv_max - Kv_min) * sw;
+  // 5) direction-change gating using accel
+  float a_tgt = (w_tgt - w_tgt_prev) / fmaxf(dt, 1e-3f);
+  w_tgt_prev = w_tgt;
 
-    // 6) rate-control
-    float omega_cmd = Kp * e_deg + (Kv * g) * omega_tgt_f;
+  float ga = 1.0f - clampf((fabsf(a_tgt) - A_SOFT) / (A_HARD - A_SOFT), 0.0f, 1.0f);
+  float gconf = clampf(conf, 0.0f, 1.0f);
+  float g = ga * gconf; // gate feed-forward
 
-    // 7) clamp speed
-    omega_cmd = clamp(omega_cmd, -OMEGA_MAX, +OMEGA_MAX);
+  // 6) adaptive Kp by error magnitude
+  float se = clampf((fabsf(e) - E_SMALL) / (E_LARGE - E_SMALL), 0.0f, 1.0f);
+  float Kp = KP_MIN + (KP_MAX - KP_MIN) * se;
 
-    // 8) clamp accel (smooth command)
-    float dw = A_MAX * dt;
-    omega_cmd = clamp(omega_cmd, omega_cmd_prev - dw, omega_cmd_prev + dw);
-    omega_cmd_prev = omega_cmd;
+  // 7) adaptive feed-forward strength + prediction horizon
+  float Kff = KFF_MIN + (KFF_MAX - KFF_MIN) * sw;
+  float Tpred = TPRED_MIN + (TPRED_MAX - TPRED_MIN) * sw;
 
-    // 9) integrate to absolute setpoint
-    az_sp = wrap_360(az_sp + omega_cmd * dt);
+  // 8) desired absolute azimuth (unlimited)
+  float az_des = wrap360(az_cmd + Kp*e + (Kff*g)*w_tgt_f*Tpred);
 
-    send_pan_absolute(az_sp);
+  // 9) desired setpoint rate (shortest path)
+  float d = angDiffDeg(az_des, az_cmd);  // deg
+  float w_cmd = d / dt;                  // deg/s
+
+  // 10) clamp speed & accel to mechanical limits
+  w_cmd = clampf(w_cmd, -W_MAX, +W_MAX);
+
+  float dw = A_MAX * dt;
+  w_cmd = clampf(w_cmd, w_cmd_prev - dw, w_cmd_prev + dw);
+  w_cmd_prev = w_cmd;
+
+  // 11) integrate to new absolute setpoint and send
+  az_cmd = wrap360(az_cmd + w_cmd * dt);
+  send_pan_absolute(az_cmd);
 }
