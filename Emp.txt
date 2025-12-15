@@ -1,131 +1,100 @@
-static inline float clampf(float x, float lo, float hi){
-  return (x < lo) ? lo : (x > hi) ? hi : x;
-}
-
-static inline float wrap360(float a){
-  while (a >= 360.0f) a -= 360.0f;
-  while (a <  0.0f)   a += 360.0f;
-  return a;
-}
-
-static inline float clamp0_90(float a){
-  return clampf(a, 0.0f, 90.0f);
-}
-
-
-
-typedef struct {
-  // ===== Camera geometry =====
-  float deg_per_px_x;  // = FOV_X_DEG / RES_X  (0.009375)
-
-  // ===== Mechanical limits (given by you) =====
-  float w_max;         // max angular rate of setpoint (deg/s)  = 60
-  float a_max;         // max angular accel of setpoint (deg/s^2) = 60
-
-  // ===== Deadband =====
-  float e_db_deg;      // deadband in deg, to prevent jitter near center
-                       // Recommend: 0.02~0.05 deg (≈ 2~5 px)
-
-  // ===== Adaptive speed thresholds (deg/s) =====
-  float w_low;         // below this => "slow/steady" regime
-  float w_high;        // above this => "fast" regime
-                       // Recommend: w_low=2, w_high=20
-
-  // ===== Adaptive error thresholds (deg) =====
-  float e_small;       // small error => keep Kp low (smooth)
-  float e_large;       // large error => increase Kp (catch-up)
-                       // Recommend: e_small ~ e_db_deg
-                       //            e_large ~ 0.3 deg (~32 px)
-
-  // ===== Feed-forward gating by angular acceleration (deg/s^2) =====
-  float a_soft;        // start reducing feed-forward above this
-  float a_hard;        // feed-forward almost off above this
-                       // Recommend: a_soft=80, a_hard=250 (tune)
-
-  // ===== Gain ranges =====
-  float kp_min;        // outer-loop proportional gain (deg/s per deg)
-  float kp_max;
-                       // Recommend: kp_min=1.5, kp_max=4.0
-
-  float kff_min;       // feed-forward gain (dimensionless)
-  float kff_max;
-                       // Recommend: kff_min=0.6, kff_max=1.6
-
-  // ===== Rate filter schedule =====
-  float alpha_slow;    // EMA alpha when target is slow (more smoothing)
-  float alpha_fast;    // EMA alpha when target is fast (less smoothing)
-                       // Recommend: 0.9 and 0.6
-
-} PanParams;
-
-typedef struct {
-  // Internal states
-  float az_sp;         // last sent azimuth setpoint [0..360)
-  float u_prev;        // previous target x position in pixels
-  float w_tgt_prev;    // previous target angular rate (deg/s)
-  float w_tgt_f;       // filtered target angular rate (deg/s)
-  float w_cmd_prev;    // previous commanded setpoint rate (deg/s)
-} PanState;
-
 void update_pan_adaptive(
     const PanParams* P,
     PanState* S,
-    float dt,          // seconds, MUST be real dt between frames
-    float u,           // target center x in pixels
-    float conf,        // 0..1 pseudo confidence; if none, pass 1.0
-    float cx)          // 320 for 640 width
+    float dt,
+    float u,
+    float conf,
+    float cx)
 {
-  // 1) Image error in degrees
+  // --------- SAFETY: dt ----------
+  dt = clampf(dt, 1e-3f, 0.2f);
+
+  // --------- 1) Image error (deg) ----------
   float e = (u - cx) * P->deg_per_px_x;
 
-  // 2) Deadband to suppress jitter near center
-  //    If within deadband, treat error as zero (no correction).
-  if (e > -P->e_db_deg && e < P->e_db_deg) {
+  // Deadband
+  if (e > -P->e_db_deg && e < P->e_db_deg)
     e = 0.0f;
+
+  // --------- INIT / WARM-UP HANDLING ----------
+  if (!S->valid) {
+    // Frame đầu tiên sau reset:
+    // - không tính vận tốc
+    // - không feed-forward
+    // - không accel limit
+    float w_cmd = P->kp_min * e;
+
+    // Clamp tốc độ
+    w_cmd = clampf(w_cmd, -P->w_max, +P->w_max);
+
+    // Integrate trực tiếp
+    S->az_sp = wrap360(S->az_sp + w_cmd * dt);
+
+    // Khởi tạo state cho frame sau
+    S->u_prev     = u;
+    S->w_tgt_prev = 0.0f;
+    S->w_tgt_f    = 0.0f;
+    S->w_cmd_prev = w_cmd;
+
+    S->warmup_cnt++;
+
+    // Sau 1–2 frame thì coi như valid
+    if (S->warmup_cnt >= 2) {
+      S->valid = 1;
+    }
+
+    send_pan_absolute(S->az_sp);
+    return;
   }
 
-  // 3) Target angular rate from image (deg/s)
-  float w_tgt = ((u - S->u_prev) / clampf(dt, 1e-3f, 1.0f)) * P->deg_per_px_x;
+  // --------- 2) Target angular rate (deg/s) ----------
+  float w_tgt = ((u - S->u_prev) / dt) * P->deg_per_px_x;
   S->u_prev = u;
 
-  // 4) Speed scale sw in [0..1] => slow->0, fast->1
-  float sw = clampf((fabsf(w_tgt) - P->w_low) / (P->w_high - P->w_low), 0.0f, 1.0f);
+  // --------- 3) Speed scale ----------
+  float sw = clampf((fabsf(w_tgt) - P->w_low) /
+                    (P->w_high - P->w_low), 0.0f, 1.0f);
 
-  // 5) Adaptive EMA filter for w_tgt:
-  //    slow -> heavier smoothing; fast -> less smoothing.
-  float alpha = P->alpha_slow - (P->alpha_slow - P->alpha_fast) * sw;
+  // --------- 4) Adaptive filter ----------
+  float alpha = P->alpha_slow -
+                (P->alpha_slow - P->alpha_fast) * sw;
   S->w_tgt_f = alpha * S->w_tgt_f + (1.0f - alpha) * w_tgt;
 
-  // 6) Angular acceleration (deg/s^2) to detect sharp turns / tracker jumps
-  float a_img = (w_tgt - S->w_tgt_prev) / clampf(dt, 1e-3f, 1.0f);
+  // --------- 5) Angular acceleration ----------
+  float a_img = (w_tgt - S->w_tgt_prev) / dt;
   S->w_tgt_prev = w_tgt;
 
-  // 7) Gate feed-forward when acceleration is high (sharp direction changes)
-  float gate = 1.0f - clampf((fabsf(a_img) - P->a_soft) / (P->a_hard - P->a_soft), 0.0f, 1.0f);
-  gate *= clampf(conf, 0.0f, 1.0f); // also gate by confidence if provided
+  float gate = 1.0f -
+    clampf((fabsf(a_img) - P->a_soft) /
+           (P->a_hard - P->a_soft), 0.0f, 1.0f);
 
-  // 8) Adaptive Kp by |error|
-  float se = clampf((fabsf(e) - P->e_small) / (P->e_large - P->e_small), 0.0f, 1.0f);
-  float Kp = P->kp_min + (P->kp_max - P->kp_min) * se;
+  gate *= clampf(conf, 0.0f, 1.0f);
 
-  // 9) Adaptive Kff by speed
-  float Kff = P->kff_min + (P->kff_max - P->kff_min) * sw;
+  // --------- 6) Adaptive Kp ----------
+  float se = clampf((fabsf(e) - P->e_small) /
+                    (P->e_large - P->e_small), 0.0f, 1.0f);
+  float Kp = P->kp_min +
+             (P->kp_max - P->kp_min) * se;
 
-  // 10) Outer-loop command: desired setpoint rate (deg/s)
-  //     Feedback term pulls target to center; feed-forward term matches target motion.
+  // --------- 7) Adaptive Kff ----------
+  float Kff = P->kff_min +
+              (P->kff_max - P->kff_min) * sw;
+
+  // --------- 8) Commanded setpoint rate ----------
   float w_cmd = Kp * e + (Kff * gate) * S->w_tgt_f;
 
-  // 11) Clamp setpoint rate to mechanical max rate
+  // --------- 9) Clamp speed ----------
   w_cmd = clampf(w_cmd, -P->w_max, +P->w_max);
 
-  // 12) Clamp change of w_cmd (accel limit of setpoint trajectory)
-  float dw_max = P->a_max * dt;               // deg/s per frame
-  w_cmd = clampf(w_cmd, S->w_cmd_prev - dw_max, S->w_cmd_prev + dw_max);
+  // --------- 10) Clamp accel ----------
+  float dw = P->a_max * dt;
+  w_cmd = clampf(w_cmd,
+                 S->w_cmd_prev - dw,
+                 S->w_cmd_prev + dw);
   S->w_cmd_prev = w_cmd;
 
-  // 13) Integrate to absolute azimuth setpoint
+  // --------- 11) Integrate ----------
   S->az_sp = wrap360(S->az_sp + w_cmd * dt);
 
-  // 14) Send absolute setpoint (0..360)
   send_pan_absolute(S->az_sp);
 }
