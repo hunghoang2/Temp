@@ -1,52 +1,288 @@
-// mainwindow.cpp
-#include "mainwindow.h"
-#include <QDebug>
+Dùng vật cố định (cây) tune adaptive được và rất hiệu quả để làm hệ “êm – không rung – không nhảy setpoint”. Nhưng vì cây không tạo chuyển động thật, bạn sẽ tune adaptive theo 2 pha:
 
-MainWindow::MainWindow(QWidget *parent)
-    : QMainWindow(parent)
-{
-    m_server = new ServerManager(this);
-    connect(m_server, &ServerManager::statusUpdated,
-            this, &MainWindow::onServerStatusUpdated);
-}
+1. Pha tĩnh: mục tiêu đứng yên → tune deadband, Kp_min, kff_min, alpha_slow, gating để không bơm nhiễu.
 
-void MainWindow::onServerStatusUpdated(const ServerStatus &status)
-{
-    QSet<QString> currentErrors;
-    for (const auto &err : status.errors)
-        currentErrors.insert(err.code);
 
-    // 1️⃣ Loại bỏ lỗi đã biến mất khỏi server
-    for (auto it = m_activeErrors.begin(); it != m_activeErrors.end(); )
-    {
-        if (!currentErrors.contains(*it))
-            it = m_activeErrors.erase(it); // lỗi biến mất
-        else
-            ++it;
-    }
+2. Pha giả động: tạo chuyển động “ảo” bằng cách quay rig/pan theo kịch bản (hoặc lắc nhẹ camera) → tune w_low/w_high, kff_max, alpha_fast, a_soft/a_hard.
 
-    // 2️⃣ Duyệt lỗi mới để hiển thị
-    for (const auto &err : status.errors)
-    {
-        if (m_activeErrors.contains(err.code))
-            continue; // lỗi này đã hiển thị rồi
 
-        // Hiển thị lỗi mới
-        auto *msgBox = new QMessageBox(QMessageBox::Critical,
-                                       "Lỗi hệ thống",
-                                       QString("Mã lỗi: %1\n%2").arg(err.code, err.message),
-                                       QMessageBox::Ok,
-                                       this);
 
-        // Khi người dùng tắt, loại bỏ lỗi khỏi danh sách
-        connect(msgBox, &QMessageBox::finished, this, [=](int){
-            m_activeErrors.remove(err.code);
-            msgBox->deleteLater();
-        });
+Mình viết quy trình cụ thể theo đúng tham số trong code bạn đang dùng.
 
-        msgBox->show();
 
-        // Đánh dấu lỗi đã hiển thị
-        m_activeErrors.insert(err.code);
-    }
-}
+---
+
+Chuẩn bị
+
+Log tối thiểu mỗi frame:
+
+e_deg (error deg)
+
+w_tgt và w_tgt_f
+
+a_img
+
+sw, Kp, Kff, gate
+
+w_cmd (deg/s) + trạng thái clamp ω/a
+
+az_sp
+
+
+Quy đổi nhanh: deg_per_px = 0.009375, nên:
+
+2 px ≈ 0.01875°
+
+5 px ≈ 0.0469°
+
+yêu cầu 0.6° ≈ 64 px
+
+
+
+---
+
+Pha 1: Tune với cây đứng yên (không tạo chuyển động)
+
+1) Tune e_db_deg (deadband) – quan trọng nhất cho tĩnh
+
+Mục tiêu: khi target đứng yên, az_sp gần như không “lắc”.
+
+Cách làm
+
+Set tạm: kff_min = 0 (tắt FF) để nhìn rung do feedback thôi.
+
+Bắt đầu e_db_deg = 2 px (~0.01875°)
+
+Nếu thấy pan vẫn “rít rít”/setpoint nhấp nháy: tăng dần 3 px → 4 px → 5 px
+
+Dừng khi rung giảm rõ rệt nhưng vẫn kéo về tâm được.
+
+
+Dấu hiệu đúng
+
+e_deg dao động trong deadband và w_cmd ≈ 0 phần lớn thời gian.
+
+
+
+---
+
+2) Tune kp_min (và kp_max tạm thời chưa cần)
+
+Vì cây đứng yên nên sw ≈ 0, hệ sẽ thường dùng kp_min.
+
+Cách làm
+
+Đặt kp_max tạm bằng kp_min (để khỏi dính scheduling), ví dụ:
+
+kp_min = kp_max
+
+
+Thử kp_min: 1.0 → 1.5 → 2.0 → 3.0
+
+Mỗi lần tăng, cố tình tạo lệch ban đầu (pan lệch vài độ hoặc chọn điểm track lệch tâm), xem:
+
+thời gian kéo về tâm
+
+có overshoot/hunting không
+
+
+
+Chọn giá trị
+
+Nếu kéo về chậm và cứ “lụt”: tăng kp_min
+
+Nếu qua tâm rồi lắc: giảm kp_min hoặc tăng e_db_deg
+
+Với cây, thường kp_min ổn ở 1.5–3.0
+
+
+
+---
+
+3) Bật FF tối thiểu: tune kff_min + alpha_slow
+
+Giờ bật lại feed-forward ở chế độ “chậm” để đảm bảo không bơm nhiễu khi đứng yên.
+
+Cách làm
+
+Set:
+
+kff_min = 0.4 (bắt đầu nhỏ)
+
+alpha_slow = 0.9 (lọc mạnh)
+
+
+Giữ cây đứng yên, theo dõi w_tgt do jitter CSRT:
+
+Nếu az_sp bắt đầu rung tăng lên khi bật FF:
+
+tăng alpha_slow lên 0.93–0.97
+
+hoặc giảm kff_min xuống 0.2–0.4
+
+hoặc tăng deadband thêm 1 px
+
+
+
+
+Mục tiêu
+
+Bật FF nhưng vẫn “êm như tắt FF”.
+
+
+> Lưu ý: với CSRT, “jitter vận tốc” là bình thường, nên alpha_slow cao là đúng.
+
+
+
+
+---
+
+4) Tune gating “đổi hướng” cho tĩnh: a_soft/a_hard
+
+Với cây đứng yên, a_img phần lớn là nhiễu. Gating giúp FF không bị kích sai.
+
+Cách làm
+
+Xem thống kê |a_img| khi đứng yên (log 5–10s).
+
+Chọn:
+
+a_soft hơi lớn hơn nhiễu nền
+
+a_hard khoảng 2–3× a_soft
+
+
+
+Gợi ý nhanh nếu không muốn thống kê
+
+a_soft = 80, a_hard = 250 (thường ổn)
+
+Nếu vẫn thấy FF bơm nhiễu (gate ~1 nhưng tracker jitter): tăng a_soft/a_hard không giúp nhiều bằng tăng alpha_slow + giảm kff_min.
+
+
+
+---
+
+Pha 2: Tune “nhanh/chậm” bằng chuyển động giả lập (vẫn dùng cây)
+
+Bạn cần tạo w_tgt khác 0. Có 2 cách dễ:
+
+Cách A: chủ động gửi pan setpoint “quay qua lại” (sin) để cây chạy trên ảnh.
+
+Cách B: xoay rig/camera nhẹ tay (ít khuyến nghị vì khó lặp lại).
+
+
+Khuyến nghị cách A vì lặp lại được.
+
+5) Tune w_low/w_high
+
+Mục tiêu: phân biệt “chậm” và “nhanh” đúng với thực tế.
+
+Cách làm
+
+Cho pan chạy sin:
+
+bắt đầu tốc độ thấp (ví dụ 2–5°/s), rồi tăng lên 10–20°/s
+
+
+Log |w_tgt_f| khi “chậm” và khi “nhanh”
+
+Chọn:
+
+w_low ≈ tốc độ mà bạn vẫn muốn coi là “chậm” (thường 2°/s)
+
+w_high ≈ tốc độ mà bạn coi là “nhanh” (thường 20°/s; nếu mục tiêu có thể gần thì 30–40)
+
+
+
+
+---
+
+6) Tune kff_max + alpha_fast
+
+Khi “nhanh”, feed-forward phải đủ mạnh để không lụt.
+
+Cách làm
+
+Set ban đầu:
+
+kff_max = 1.2
+
+alpha_fast = 0.6
+
+
+Tăng tốc sin đến mức “khó”, xem error e_deg có bị kéo lệch 1 phía không:
+
+Nếu bị lụt (error lớn và không về): tăng kff_max 1.4 → 1.6
+
+Nếu dao động/nhấp nháy: tăng alpha_fast lên 0.7 hoặc giảm kff_max
+
+
+
+Mục tiêu
+
+Ở tốc độ cao, error vẫn nằm trong yêu cầu (≤0.6°) phần lớn thời gian.
+
+
+
+---
+
+7) Tune kp_max và e_small/e_large
+
+e_small nên gần deadband: e_small ≈ e_db_deg
+
+e_large nên là mức lệch “đủ lớn cần kéo mạnh”, ví dụ:
+
+e_large = 0.3° (~32 px) hoặc 0.6° nếu bạn muốn chỉ tăng mạnh khi gần vượt spec.
+
+
+
+Tune kp_max
+
+Khi chạy nhanh/đổi chiều (sin), nếu lúc peak speed error tăng lớn:
+
+tăng kp_max (3.5 → 4.5)
+
+
+Nếu overshoot quanh tâm:
+
+giảm kp_max hoặc tăng e_db_deg
+
+
+
+
+---
+
+Bộ tham số “khởi điểm tốt” (đã tune theo cây)
+
+Bạn có thể dùng làm baseline rồi chỉnh:
+
+e_db_deg = 0.028° (≈3 px)
+
+kp_min = 2.0, kp_max = 4.0
+
+kff_min = 0.4, kff_max = 1.5
+
+alpha_slow = 0.95, alpha_fast = 0.65
+
+w_low = 2°/s, w_high = 20°/s
+
+a_soft = 80°/s², a_hard = 250°/s²
+
+e_small = e_db_deg, e_large = 0.3°
+
+
+
+---
+
+Mẹo quan trọng khi tune bằng cây (để khỏi “ảo tưởng đạt”)
+
+Nếu bạn chỉ đứng yên, hệ có thể “đẹp” nhưng ra mục tiêu bay lại lụt → vì chưa tune kff_max/alpha_fast.
+
+Vì vậy bắt buộc có pha giả động (sin/quay) để tune phần “nhanh”.
+
+
+
+---
+
+Nếu bạn nói bạn đang điều khiển bằng Python hay C++, mình sẽ đưa luôn một “kịch bản sin test” (gửi setpoint như nào theo thời gian) và bảng log/plot mẫu để bạn nhìn 1 lần là biết nên tăng/giảm tham số nào.
