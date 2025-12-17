@@ -1,31 +1,24 @@
-#include <fcntl.h>
-#include <unistd.h>
-#include <stdint.h>
-#include <stdio.h>
-#include <errno.h>
-#include <string.h>
-
-#define PI_DEVICE "/dev/piControl0"
-#define AI1_OFFSET 32      // <-- thay bằng offset thật
-#define AI1_SIZE   2
-
-int main() {
-    int fd = open(PI_DEVICE, O_RDONLY);
-    if (fd < 0) {
-        perror("open piControl0");
-        return 1;
+auto get_double = [](const web::json::value& j, const utility::string_t& k, double def){
+    if (!j.has_field(k)) return def;
+    const auto& v = j.at(k);
+    if (v.is_number()) return v.as_double();
+    if (v.is_string()) {
+        try { return std::stod(utility::conversions::to_utf8string(v.as_string())); }
+        catch (...) { return def; }
     }
+    return def; // null/object/array/bool
+};
 
-    uint16_t raw = 0;
-    ssize_t r = pread(fd, &raw, AI1_SIZE, AI1_OFFSET);
-    if (r != AI1_SIZE) {
-        printf("pread failed: %s\n", strerror(errno));
-        close(fd);
-        return 2;
+
+req.extract_json(true)
+.then([=](pplx::task<web::json::value> t) mutable {
+    try {
+        auto body = t.get(); // nếu parse fail -> throw ở đây
+        double chiller_flow = get_double(body, U("chiller_flow"), 0.0);
+        // ...
+        req.reply(web::http::status_codes::OK, U("OK"));
+    } catch (const std::exception& e) {
+        req.reply(web::http::status_codes::BadRequest,
+                  utility::conversions::to_string_t(e.what()));
     }
-
-    close(fd);
-
-    printf("AnalogInput_1 raw = %u\n", raw);
-    return 0;
-}
+});
