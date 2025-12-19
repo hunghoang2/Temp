@@ -10,3 +10,24 @@ double ticks_to_seconds(uint64_t ticks)
 {
     return (double)ticks / 10000000.0;
 }
+#include <iostream>
+#include <iomanip>
+
+void print_time_utc_plus_7(uint64_t ticks)
+{
+    time_t utc = ticks_to_unix_utc(ticks);
+
+    // UTC +7
+    utc += 7 * 3600;
+
+    std::tm tm{};
+    gmtime_r(&utc, &tm);   // dùng gmtime vì đã cộng offset
+
+    std::cout << std::put_time(&tm, "%Y-%m-%d %H:%M:%S");
+
+    // milliseconds
+    uint64_t sub_ticks = ticks % TICKS_PER_SEC;
+    uint64_t ms = sub_ticks / 10000; // 100ns → ms
+
+    std::cout << "." << std::setw(3) << std::setfill('0') << ms << " (UTC+7)\n";
+}
