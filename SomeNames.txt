@@ -1,24 +1,12 @@
-auto get_double = [](const web::json::value& j, const utility::string_t& k, double def){
-    if (!j.has_field(k)) return def;
-    const auto& v = j.at(k);
-    if (v.is_number()) return v.as_double();
-    if (v.is_string()) {
-        try { return std::stod(utility::conversions::to_utf8string(v.as_string())); }
-        catch (...) { return def; }
-    }
-    return def; // null/object/array/bool
-};
+#include <stdint.h>
 
+uint64_t ticks_from_regs(uint16_t w0, uint16_t w1, uint16_t w2, uint16_t w3)
+{
+    return ((uint64_t)w3 << 48) | ((uint64_t)w2 << 32) | ((uint64_t)w1 << 16) | (uint64_t)w0;
+}
 
-req.extract_json(true)
-.then([=](pplx::task<web::json::value> t) mutable {
-    try {
-        auto body = t.get(); // nếu parse fail -> throw ở đây
-        double chiller_flow = get_double(body, U("chiller_flow"), 0.0);
-        // ...
-        req.reply(web::http::status_codes::OK, U("OK"));
-    } catch (const std::exception& e) {
-        req.reply(web::http::status_codes::BadRequest,
-                  utility::conversions::to_string_t(e.what()));
-    }
-});
+// 100ns ticks -> seconds
+double ticks_to_seconds(uint64_t ticks)
+{
+    return (double)ticks / 10000000.0;
+}
