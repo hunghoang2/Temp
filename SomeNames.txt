@@ -12,7 +12,15 @@ double ticks_to_seconds(uint64_t ticks)
 }
 #include <iostream>
 #include <iomanip>
+#include <ctime>
 
+constexpr uint64_t TICKS_PER_SEC = 10000000ULL;
+constexpr uint64_t DOTNET_TO_UNIX_EPOCH_TICKS = 621355968000000000ULL;
+
+time_t ticks_to_unix_utc(uint64_t ticks)
+{
+    return (time_t)((ticks - DOTNET_TO_UNIX_EPOCH_TICKS) / TICKS_PER_SEC);
+}
 void print_time_utc_plus_7(uint64_t ticks)
 {
     time_t utc = ticks_to_unix_utc(ticks);
