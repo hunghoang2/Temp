@@ -1,19 +1,15 @@
-#include <ctime>
-#include <iomanip>
-#include <sstream>
-#include <string>
+#include <QDateTime>
+#include <QString>
 
-std::string utc_to_string_am_pm(time_t utc_ts)
+QString utcToStringAMPM(qint64 utcSeconds)
 {
-    // UTC -> tm
-    std::tm utc_tm = *gmtime(&utc_ts);
+    QDateTime dt = QDateTime::fromSecsSinceEpoch(
+        utcSeconds,
+        Qt::UTC
+    );
 
     // UTC+7 (Việt Nam)
-    utc_tm.tm_hour += 7;
-    mktime(&utc_tm); // normalize lại ngày/tháng/năm
+    dt = dt.toTimeZone(QTimeZone("Asia/Ho_Chi_Minh"));
 
-    std::ostringstream oss;
-    oss << std::put_time(&utc_tm, "%d/%m/%Y %I:%M %p");
-
-    return oss.str();
+    return dt.toString("dd/MM/yyyy h:mm AP");
 }
