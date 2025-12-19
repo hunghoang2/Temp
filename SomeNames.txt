@@ -1,41 +1,19 @@
-#include <stdint.h>
-
-uint64_t ticks_from_regs(uint16_t w0, uint16_t w1, uint16_t w2, uint16_t w3)
-{
-    return ((uint64_t)w3 << 48) | ((uint64_t)w2 << 32) | ((uint64_t)w1 << 16) | (uint64_t)w0;
-}
-
-// 100ns ticks -> seconds
-double ticks_to_seconds(uint64_t ticks)
-{
-    return (double)ticks / 10000000.0;
-}
-#include <iostream>
-#include <iomanip>
 #include <ctime>
+#include <iomanip>
+#include <sstream>
+#include <string>
 
-constexpr uint64_t TICKS_PER_SEC = 10000000ULL;
-constexpr uint64_t DOTNET_TO_UNIX_EPOCH_TICKS = 621355968000000000ULL;
-
-time_t ticks_to_unix_utc(uint64_t ticks)
+std::string utc_to_string_am_pm(time_t utc_ts)
 {
-    return (time_t)((ticks - DOTNET_TO_UNIX_EPOCH_TICKS) / TICKS_PER_SEC);
-}
-void print_time_utc_plus_7(uint64_t ticks)
-{
-    time_t utc = ticks_to_unix_utc(ticks);
+    // UTC -> tm
+    std::tm utc_tm = *gmtime(&utc_ts);
 
-    // UTC +7
-    utc += 7 * 3600;
+    // UTC+7 (Việt Nam)
+    utc_tm.tm_hour += 7;
+    mktime(&utc_tm); // normalize lại ngày/tháng/năm
 
-    std::tm tm{};
-    gmtime_r(&utc, &tm);   // dùng gmtime vì đã cộng offset
+    std::ostringstream oss;
+    oss << std::put_time(&utc_tm, "%d/%m/%Y %I:%M %p");
 
-    std::cout << std::put_time(&tm, "%Y-%m-%d %H:%M:%S");
-
-    // milliseconds
-    uint64_t sub_ticks = ticks % TICKS_PER_SEC;
-    uint64_t ms = sub_ticks / 10000; // 100ns → ms
-
-    std::cout << "." << std::setw(3) << std::setfill('0') << ms << " (UTC+7)\n";
+    return oss.str();
 }
