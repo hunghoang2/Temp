@@ -15,3 +15,8 @@ gst-launch-1.0 -v \
   ! jpegenc quality=85 \
   ! rtpjpegpay \
   ! tcpserversink host=0.0.0.0 port=5000
+
+
+gst-launch-1.0 videotestsrc is-live=true \
+! video/x-raw,framerate=60/1 \
+! fpsdisplaysink video-sink=autovideosink text-overlay=true
