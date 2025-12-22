@@ -16,6 +16,14 @@ gst-launch-1.0 -v \
   ! rtpjpegpay \
   ! tcpserversink host=0.0.0.0 port=5000
 
+gst-launch-1.0 -v \
+  videotestsrc is-live=true pattern=smpte \
+  ! video/x-raw,width=1280,height=720,framerate=60/1 \
+  ! videoconvert \
+  ! video/x-raw,format=I420 \
+  ! jpegenc quality=85 \
+  ! rtpjpegpay \
+  ! tcpserversink host=0.0.0.0 port=5000
 
 gst-launch-1.0 videotestsrc is-live=true \
 ! video/x-raw,framerate=60/1 \
