@@ -5,3 +5,13 @@ gst-launch-1.0 -v \
   ! jpegenc quality=85 idct-method=float \
   ! rtpjpegpay \
   ! tcpserversink host=0.0.0.0 port=5000
+
+
+gst-launch-1.0 -v \
+  videotestsrc is-live=true \
+  ! video/x-raw,width=1280,height=720,framerate=60/1 \
+  ! videoconvert \
+  ! video/x-raw,format=YUY2 \
+  ! jpegenc quality=85 \
+  ! rtpjpegpay \
+  ! tcpserversink host=0.0.0.0 port=5000
