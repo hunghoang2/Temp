@@ -28,3 +28,11 @@ gst-launch-1.0 -v \
 gst-launch-1.0 videotestsrc is-live=true \
 ! video/x-raw,framerate=60/1 \
 ! fpsdisplaysink video-sink=autovideosink text-overlay=true
+
+gst-launch-1.0 -v \
+  tcpclientsrc host=<IP_SENDER> port=5000 \
+  ! application/x-rtp,media=video,encoding-name=JPEG,payload=26,clock-rate=90000 \
+  ! rtpjpegdepay \
+  ! jpegdec \
+  ! videoconvert \
+  ! autovideosink sync=false
