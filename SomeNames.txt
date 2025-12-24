@@ -1,97 +1,163 @@
+// ZmqServerDealer.hpp
+#pragma once
 #include <zmq.hpp>
-#include <thread>
+
 #include <atomic>
-#include <iostream>
 #include <chrono>
+#include <condition_variable>
+#include <cstdint>
+#include <deque>
+#include <functional>
+#include <mutex>
 #include <string>
+#include <thread>
 
-class DealerClient {
+class ZmqServerDealer {
 public:
-    DealerClient(const std::string& endpoint)
-        : ctx_(1), running_(true), endpoint_(endpoint) {}
+    using RxHandler = std::function<void(const std::string&)>;
 
-    void start() {
-        // inproc pipe: app threads -> io thread
-        tx_pipe_ = std::make_unique<zmq::socket_t>(ctx_, zmq::socket_type::pair);
-        tx_pipe_->bind("inproc://txpipe");
+    ZmqServerDealer(std::string endpoint, std::string routingId = "")
+        : endpoint_(std::move(endpoint)), routingId_(std::move(routingId)),
+          ctx_(1), running_(false) {}
 
-        io_thread_ = std::thread([this]{ io_loop(); });
+    ~ZmqServerDealer() { stop(); }
+
+    // onMessage sẽ chạy trong "rx thread riêng" (không phải IO thread)
+    void start(RxHandler onMessage) {
+        if (running_.exchange(true)) return;
+        onMessage_ = std::move(onMessage);
+
+        // Thread 1: IO thread owns dealer socket (ONLY thread touching dealer)
+        ioThread_ = std::thread([this] { ioLoop(); });
+
+        // Thread 2: RX worker thread (runs callback / business logic)
+        rxThread_ = std::thread([this] { rxLoop(); });
     }
 
     void stop() {
-        running_.store(false);
-        // poke io thread so it wakes up
-        send_async("__shutdown__");
-        if (io_thread_.joinable()) io_thread_.join();
+        if (!running_.exchange(false)) return;
+
+        // wake threads
+        {
+            std::lock_guard<std::mutex> lk(txMtx_);
+            // nothing
+        }
+        txCv_.notify_all();
+
+        {
+            std::lock_guard<std::mutex> lk(rxMtx_);
+            // nothing
+        }
+        rxCv_.notify_all();
+
+        if (ioThread_.joinable()) ioThread_.join();
+        if (rxThread_.joinable()) rxThread_.join();
     }
 
-    // thread-safe API: any thread can call
-    void send_async(const std::string& s) {
-        // NOTE: This function can be called from any thread,
-        // but the socket used here (tx_pipe_) is NOT safe if shared.
-        // So we create a per-call socket or store thread-local socket.
-        // Easiest: create a local PAIR and connect each call (ok for low rate),
-        // or create thread_local socket.
-
-        thread_local zmq::socket_t tls_tx(ctx_, zmq::socket_type::pair);
-        thread_local bool inited = false;
-        if (!inited) {
-            tls_tx.connect("inproc://txpipe");
-            inited = true;
+    // Thread-safe API: can be called from ANY thread.
+    void send(const std::string& msg) {
+        if (!running_.load()) return;
+        {
+            std::lock_guard<std::mutex> lk(txMtx_);
+            txQueue_.push_back(msg);
         }
-        tls_tx.send(zmq::buffer(s), zmq::send_flags::none);
+        txCv_.notify_one();
     }
 
 private:
-    void io_loop() {
-        zmq::socket_t dealer(ctx_, zmq::socket_type::dealer);
-        dealer.connect(endpoint_);
-        dealer.set(zmq::sockopt::rcvtimeo, 50);
+    // ======================
+    // RX worker thread stuff
+    // ======================
+    void rxLoop() {
+        while (running_.load()) {
+            std::string msg;
+            {
+                std::unique_lock<std::mutex> lk(rxMtx_);
+                rxCv_.wait_for(lk, std::chrono::milliseconds(200), [&] {
+                    return !running_.load() || !rxQueue_.empty();
+                });
+                if (!running_.load() && rxQueue_.empty()) break;
+                if (rxQueue_.empty()) continue;
+                msg = std::move(rxQueue_.front());
+                rxQueue_.pop_front();
+            }
+            // callback outside lock
+            if (onMessage_) onMessage_(msg);
+        }
+    }
 
-        zmq::socket_t rx_from_app(ctx_, zmq::socket_type::pair);
-        rx_from_app.connect("inproc://txpipe");
-        rx_from_app.set(zmq::sockopt::rcvtimeo, 50);
+    // ======================
+    // IO thread (ONLY owner of dealer socket)
+    // ======================
+    void ioLoop() {
+        zmq::socket_t dealer(ctx_, zmq::socket_type::dealer);
+
+        // Optional routing id (helps peer identify you)
+        if (!routingId_.empty()) {
+            dealer.set(zmq::sockopt::routing_id, routingId_);
+        }
+
+        // Practical timeouts to allow graceful stop
+        dealer.set(zmq::sockopt::rcvtimeo, 50);
+        dealer.set(zmq::sockopt::sndtimeo, 50);
+        dealer.set(zmq::sockopt::linger, 0);
+
+        dealer.connect(endpoint_);
 
         while (running_.load()) {
-            // 1) recv from server
-            zmq::message_t msg;
-            if (dealer.recv(msg, zmq::recv_flags::none)) {
-                std::string s((char*)msg.data(), msg.size());
-                std::cout << "[RX FROM SERVER] " << s << "\n";
+            // 1) Receive from peer (non-blocking with rcvtimeo)
+            zmq::message_t in;
+            if (dealer.recv(in, zmq::recv_flags::none)) {
+                std::string s(static_cast<char*>(in.data()), in.size());
+                {
+                    std::lock_guard<std::mutex> lk(rxMtx_);
+                    rxQueue_.push_back(std::move(s));
+                }
+                rxCv_.notify_one();
             }
 
-            // 2) send pending from app threads
-            zmq::message_t out;
-            if (rx_from_app.recv(out, zmq::recv_flags::none)) {
-                std::string s((char*)out.data(), out.size());
-                if (s == "__shutdown__") break;
-                dealer.send(out, zmq::send_flags::none);
+            // 2) Send pending tx messages (drain queue)
+            // Wait a bit only if nothing to send to reduce CPU
+            std::string out;
+            {
+                std::unique_lock<std::mutex> lk(txMtx_);
+                if (txQueue_.empty()) {
+                    txCv_.wait_for(lk, std::chrono::milliseconds(10), [&] {
+                        return !running_.load() || !txQueue_.empty();
+                    });
+                }
+                if (!running_.load() && txQueue_.empty()) break;
+                if (!txQueue_.empty()) {
+                    out = std::move(txQueue_.front());
+                    txQueue_.pop_front();
+                }
+            }
+
+            if (!out.empty()) {
+                // If you need multipart frames, do it here in IO thread.
+                dealer.send(zmq::buffer(out), zmq::send_flags::none);
             }
         }
-        std::cout << "[IO LOOP] exit\n";
     }
+
+private:
+    std::string endpoint_;
+    std::string routingId_;
 
     zmq::context_t ctx_;
     std::atomic<bool> running_;
-    std::string endpoint_;
 
-    std::unique_ptr<zmq::socket_t> tx_pipe_;
-    std::thread io_thread_;
+    RxHandler onMessage_;
+    std::thread ioThread_;
+    std::thread rxThread_;
+
+    // outgoing queue
+    std::mutex txMtx_;
+    std::condition_variable txCv_;
+    std::deque<std::string> txQueue_;
+
+    // incoming queue (IO -> RX worker)
+    std::mutex rxMtx_;
+    std::condition_variable rxCv_;
+    std::deque<std::string> rxQueue_;
 };
-
-// demo
-int main() {
-    DealerClient c("tcp://127.0.0.1:6000");
-    c.start();
-
-    std::thread t([&]{
-        for (int i=0;i<10;i++){
-            c.send_async("hello " + std::to_string(i));
-            std::this_thread::sleep_for(std::chrono::milliseconds(200));
-        }
-    });
-
-    std::cin.get();
-    c.stop();
-    t.join();
-}
