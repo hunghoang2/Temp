@@ -1,15 +1,97 @@
-#include <QDateTime>
-#include <QString>
+#include <zmq.hpp>
+#include <thread>
+#include <atomic>
+#include <iostream>
+#include <chrono>
+#include <string>
 
-QString utcToStringAMPM(qint64 utcSeconds)
-{
-    QDateTime dt = QDateTime::fromSecsSinceEpoch(
-        utcSeconds,
-        Qt::UTC
-    );
+class DealerClient {
+public:
+    DealerClient(const std::string& endpoint)
+        : ctx_(1), running_(true), endpoint_(endpoint) {}
 
-    // UTC+7 (Việt Nam)
-    dt = dt.toTimeZone(QTimeZone("Asia/Ho_Chi_Minh"));
+    void start() {
+        // inproc pipe: app threads -> io thread
+        tx_pipe_ = std::make_unique<zmq::socket_t>(ctx_, zmq::socket_type::pair);
+        tx_pipe_->bind("inproc://txpipe");
 
-    return dt.toString("dd/MM/yyyy h:mm AP");
+        io_thread_ = std::thread([this]{ io_loop(); });
+    }
+
+    void stop() {
+        running_.store(false);
+        // poke io thread so it wakes up
+        send_async("__shutdown__");
+        if (io_thread_.joinable()) io_thread_.join();
+    }
+
+    // thread-safe API: any thread can call
+    void send_async(const std::string& s) {
+        // NOTE: This function can be called from any thread,
+        // but the socket used here (tx_pipe_) is NOT safe if shared.
+        // So we create a per-call socket or store thread-local socket.
+        // Easiest: create a local PAIR and connect each call (ok for low rate),
+        // or create thread_local socket.
+
+        thread_local zmq::socket_t tls_tx(ctx_, zmq::socket_type::pair);
+        thread_local bool inited = false;
+        if (!inited) {
+            tls_tx.connect("inproc://txpipe");
+            inited = true;
+        }
+        tls_tx.send(zmq::buffer(s), zmq::send_flags::none);
+    }
+
+private:
+    void io_loop() {
+        zmq::socket_t dealer(ctx_, zmq::socket_type::dealer);
+        dealer.connect(endpoint_);
+        dealer.set(zmq::sockopt::rcvtimeo, 50);
+
+        zmq::socket_t rx_from_app(ctx_, zmq::socket_type::pair);
+        rx_from_app.connect("inproc://txpipe");
+        rx_from_app.set(zmq::sockopt::rcvtimeo, 50);
+
+        while (running_.load()) {
+            // 1) recv from server
+            zmq::message_t msg;
+            if (dealer.recv(msg, zmq::recv_flags::none)) {
+                std::string s((char*)msg.data(), msg.size());
+                std::cout << "[RX FROM SERVER] " << s << "\n";
+            }
+
+            // 2) send pending from app threads
+            zmq::message_t out;
+            if (rx_from_app.recv(out, zmq::recv_flags::none)) {
+                std::string s((char*)out.data(), out.size());
+                if (s == "__shutdown__") break;
+                dealer.send(out, zmq::send_flags::none);
+            }
+        }
+        std::cout << "[IO LOOP] exit\n";
+    }
+
+    zmq::context_t ctx_;
+    std::atomic<bool> running_;
+    std::string endpoint_;
+
+    std::unique_ptr<zmq::socket_t> tx_pipe_;
+    std::thread io_thread_;
+};
+
+// demo
+int main() {
+    DealerClient c("tcp://127.0.0.1:6000");
+    c.start();
+
+    std::thread t([&]{
+        for (int i=0;i<10;i++){
+            c.send_async("hello " + std::to_string(i));
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        }
+    });
+
+    std::cin.get();
+    c.stop();
+    t.join();
 }
