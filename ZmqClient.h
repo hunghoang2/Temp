@@ -183,3 +183,27 @@ private:
     QThread thread_;
     ZmqClientWorker* worker_ = nullptr;
 };
+
+
+
+
+
+#include <zmq.hpp>
+#include <iostream>
+#include <thread>
+
+int main() {
+    zmq::context_t ctx(1);
+    zmq::socket_t dealer(ctx, zmq::socket_type::dealer);
+
+    // optional set identity (otherwise ZMQ generates one)
+    dealer.set(zmq::sockopt::routing_id, "clientA");
+
+    dealer.connect("tcp://127.0.0.1:5555");
+
+    dealer.send(zmq::buffer("ping"), zmq::send_flags::none);
+
+    zmq::message_t reply;
+    dealer.recv(reply);
+    std::cout << "Reply: " << reply.to_string() << "\n";
+}
