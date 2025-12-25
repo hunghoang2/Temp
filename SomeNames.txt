@@ -1,6 +1,6 @@
-// ZmqServer.hpp / .cpp (gộp 1 file cho dễ copy)
+// ZmqServer.hpp (gộp 1 file cho dễ copy)
 // Requires: ZeroMQ + cppzmq (zmq.hpp)
-// Compile (example): g++ -std=c++17 main.cpp -lzmq -pthread
+// g++ -std=c++17 main.cpp -lzmq -pthread
 
 #include <zmq.hpp>
 
@@ -9,30 +9,31 @@
 #include <condition_variable>
 #include <cstdint>
 #include <deque>
+#include <functional>
+#include <iostream>
 #include <mutex>
 #include <optional>
 #include <string>
 #include <thread>
+#include <unordered_set>
 #include <vector>
-#include <functional>
-#include <iostream>
 
 class ZmqServer {
 public:
-    using ReceiveCallback =
-        std::function<void(const std::string& clientId, const std::string& payload)>;
+    using ReceiveCallback = std::function<void(const std::string& payload)>;
 
-    struct Outgoing {
-        std::string clientId;  // ROUTER identity
-        std::string payload;
+    enum class SendMode {
+        ReplyToLastClient, // send to the most recently seen client
+        BroadcastToAll      // send to all known clients (tracked by identity)
     };
 
     explicit ZmqServer(std::string bindEndpoint,
-                       ReceiveCallback cb = nullptr)
+                       ReceiveCallback onRx = nullptr,
+                       SendMode mode = SendMode::ReplyToLastClient)
         : endpoint_(std::move(bindEndpoint)),
-          onReceive_(std::move(cb)),
-          ctx_(1),
-          running_(false) {}
+          onReceive_(std::move(onRx)),
+          mode_(mode),
+          ctx_(1) {}
 
     ~ZmqServer() { stop(); }
 
@@ -41,53 +42,41 @@ public:
 
     void start() {
         bool expected = false;
-        if (!running_.compare_exchange_strong(expected, true)) {
-            return; // already running
-        }
+        if (!running_.compare_exchange_strong(expected, true)) return;
         ioThread_ = std::thread(&ZmqServer::ioLoop_, this);
     }
 
     void stop() {
         bool expected = true;
-        if (!running_.compare_exchange_strong(expected, false)) {
-            return; // already stopped
-        }
+        if (!running_.compare_exchange_strong(expected, false)) return;
 
-        // Wake IO thread
-        {
-            std::lock_guard<std::mutex> lk(outMtx_);
-            // no-op
-        }
         outCv_.notify_all();
-
         if (ioThread_.joinable()) ioThread_.join();
     }
 
     // Thread-safe: can be called from any thread.
     // Returns false if server not running.
-    bool sendMessage(const std::string& clientId, const std::string& payload) {
+    bool sendMessage(const std::string& payload) {
         if (!running_.load()) return false;
         {
             std::lock_guard<std::mutex> lk(outMtx_);
-            outQueue_.push_back(Outgoing{clientId, payload});
+            outQueue_.push_back(payload);
         }
         outCv_.notify_one();
         return true;
     }
 
-    // Optional: set callback after creation
     void setReceiveCallback(ReceiveCallback cb) {
         std::lock_guard<std::mutex> lk(cbMtx_);
         onReceive_ = std::move(cb);
     }
 
+    void setSendMode(SendMode mode) { mode_ = mode; }
+
 private:
     void ioLoop_() {
         // Socket belongs ONLY to this thread
         zmq::socket_t router(ctx_, zmq::socket_type::router);
-
-        // Some recommended options for ROUTER
-        // router.set(zmq::sockopt::router_mandatory, 1); // fail if unknown identity
         router.set(zmq::sockopt::linger, 0);
 
         try {
@@ -98,67 +87,73 @@ private:
             return;
         }
 
-        // Poll interval: balance latency & CPU
-        constexpr auto kPollStep = std::chrono::milliseconds(10);
+        constexpr auto pollStep = std::chrono::milliseconds(10);
 
         while (running_.load()) {
-            // 1) Receive incoming (non-blocking poll)
             zmq::pollitem_t items[] = {
                 { static_cast<void*>(router), 0, ZMQ_POLLIN, 0 }
             };
 
             try {
-                zmq::poll(items, 1, kPollStep);
+                zmq::poll(items, 1, pollStep);
             } catch (const zmq::error_t& e) {
                 if (!running_.load()) break;
                 std::cerr << "ZmqServer poll error: " << e.what() << "\n";
                 continue;
             }
 
+            // 1) RX
             if (items[0].revents & ZMQ_POLLIN) {
-                // ROUTER message frames commonly: [identity][empty delimiter][payload]
-                // But can vary if client uses DEALER etc.
+                // ROUTER receives: [identity][...frames...]
+                // Common with DEALER: [identity][payload]
+                // Sometimes there is empty delimiter; be tolerant.
                 std::vector<zmq::message_t> frames;
                 while (true) {
                     zmq::message_t part;
-                    auto res = router.recv(part, zmq::recv_flags::none);
-                    if (!res) break;
+                    auto ok = router.recv(part, zmq::recv_flags::none);
+                    if (!ok) break;
                     frames.push_back(std::move(part));
-                    bool more = router.get(zmq::sockopt::rcvmore);
-                    if (!more) break;
+                    if (!router.get(zmq::sockopt::rcvmore)) break;
                 }
 
-                if (!frames.empty()) {
-                    std::string clientId = frames[0].to_string();
+                if (frames.size() >= 2) {
+                    const std::string clientId = frames[0].to_string();
 
-                    // Heuristic: payload at last frame
-                    std::string payload = frames.back().to_string();
+                    // payload = last non-empty frame (simple heuristic)
+                    std::string payload;
+                    for (int i = (int)frames.size() - 1; i >= 1; --i) {
+                        if (frames[i].size() > 0) { payload = frames[i].to_string(); break; }
+                    }
+                    if (payload.empty()) payload = frames.back().to_string();
+
+                    // track clients
+                    {
+                        std::lock_guard<std::mutex> lk(clientsMtx_);
+                        lastClientId_ = clientId;
+                        clients_.insert(clientId);
+                    }
 
                     ReceiveCallback cbCopy;
                     {
                         std::lock_guard<std::mutex> lk(cbMtx_);
                         cbCopy = onReceive_;
                     }
-                    if (cbCopy) cbCopy(clientId, payload);
+                    if (cbCopy) cbCopy(payload);
                 }
             }
 
-            // 2) Flush outgoing queue
+            // 2) TX
             flushOutgoing_(router);
 
-            // 3) Also wait a tiny bit if queue is empty (avoid busy loop)
-            //    But don't block too long; we already poll()ed for recv.
+            // 3) tiny wait if nothing queued (avoid spinning)
             if (isOutgoingEmpty_()) {
                 std::unique_lock<std::mutex> lk(outMtx_);
                 outCv_.wait_for(lk, std::chrono::milliseconds(1));
             }
         }
 
-        // Best effort flush before exit
         flushOutgoing_(router);
-        try {
-            router.close();
-        } catch (...) {}
+        try { router.close(); } catch (...) {}
     }
 
     bool isOutgoingEmpty_() const {
@@ -167,23 +162,45 @@ private:
     }
 
     void flushOutgoing_(zmq::socket_t& router) {
-        // pop batch to reduce lock time
-        std::deque<Outgoing> batch;
+        std::deque<std::string> batch;
         {
             std::lock_guard<std::mutex> lk(outMtx_);
             batch.swap(outQueue_);
         }
+        if (batch.empty()) return;
 
-        for (const auto& msg : batch) {
-            try {
-                // ROUTER send: [identity][empty delimiter][payload]
-                router.send(zmq::buffer(msg.clientId), zmq::send_flags::sndmore);
-                router.send(zmq::message_t{},          zmq::send_flags::sndmore);
-                router.send(zmq::buffer(msg.payload),  zmq::send_flags::none);
-            } catch (const zmq::error_t& e) {
-                // If client disappeared, send may fail depending on options
-                std::cerr << "ZmqServer send error: " << e.what() << "\n";
+        // snapshot routing info
+        std::optional<std::string> last;
+        std::vector<std::string> all;
+        {
+            std::lock_guard<std::mutex> lk(clientsMtx_);
+            if (!lastClientId_.empty()) last = lastClientId_;
+            if (mode_ == SendMode::BroadcastToAll) {
+                all.reserve(clients_.size());
+                for (auto& id : clients_) all.push_back(id);
             }
+        }
+
+        for (const auto& payload : batch) {
+            if (mode_ == SendMode::ReplyToLastClient) {
+                if (!last) continue; // no client yet
+                sendTo_(router, *last, payload);
+            } else {
+                for (const auto& id : all) {
+                    sendTo_(router, id, payload);
+                }
+            }
+        }
+    }
+
+    void sendTo_(zmq::socket_t& router, const std::string& clientId, const std::string& payload) {
+        try {
+            // ROUTER send: [identity][payload]
+            // (optional empty delimiter not required for DEALER)
+            router.send(zmq::buffer(clientId), zmq::send_flags::sndmore);
+            router.send(zmq::buffer(payload),  zmq::send_flags::none);
+        } catch (const zmq::error_t& e) {
+            std::cerr << "ZmqServer send error: " << e.what() << "\n";
         }
     }
 
@@ -194,15 +211,19 @@ private:
     mutable std::mutex cbMtx_;
     ReceiveCallback onReceive_;
 
-    // ZMQ context must outlive sockets
+    // zmq
     zmq::context_t ctx_;
-
-    // IO thread
     std::thread ioThread_;
-    std::atomic<bool> running_;
+    std::atomic<bool> running_{false};
 
-    // Thread-safe outgoing queue
+    // outgoing queue
     mutable std::mutex outMtx_;
     std::condition_variable outCv_;
-    std::deque<Outgoing> outQueue_;
+    std::deque<std::string> outQueue_;
+
+    // client tracking (ROUTER identity)
+    SendMode mode_;
+    mutable std::mutex clientsMtx_;
+    std::string lastClientId_;
+    std::unordered_set<std::string> clients_;
 };
