@@ -202,3 +202,30 @@ private:
     std::condition_variable outCv_;
     std::deque<std::string> outQueue_;
 };
+
+
+
+int main() {
+    ZmqServer::Config cfg;
+    cfg.pub_bind  = "tcp://*:5555";
+    cfg.pull_bind = "tcp://*:5556";
+
+    ZmqServer server(cfg, [](const std::string& msg){
+        // nhận từ client (100Hz)
+        // xử lý nhẹ ở đây; nếu nặng thì đẩy sang worker queue
+        // std::cout << "RX: " << msg << "\n";
+    });
+
+    server.start();
+
+    // Ví dụ thread khác publish ra client
+    std::thread t([&]{
+        using namespace std::chrono_literals;
+        while (true) {
+            server.sendMessage("from-other-thread");
+            std::this_thread::sleep_for(33ms); // ~30Hz
+        }
+    });
+
+    t.join();
+}
