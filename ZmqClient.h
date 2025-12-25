@@ -1,38 +1,73 @@
+#pragma once
+
+#include <QObject>
+#include <QByteArray>
+#include <QMutex>
+#include <QThread>
+#include <atomic>
+#include <memory>
+#include <string>
+
+// cppzmq
 #include <zmq.hpp>
-#include <chrono>
-#include <thread>
-#include <iostream>
 
-int main() {
-    zmq::context_t ctx(1);
+class ZmqClient : public QThread
+{
+    Q_OBJECT
+public:
+    struct Config {
+        std::string subEndpoint;   // vd: "tcp://127.0.0.1:5556"
+        std::string pushEndpoint;  // vd: "tcp://127.0.0.1:5557"
+        std::string subTopic = ""; // "" => subscribe all
+        int recvHz = 30;           // xử lý nhận tối đa 30/s
+        int sendHz = 100;          // gửi 100/s
+        int pollTimeoutMs = 1;     // poll nhỏ để có độ mịn tốt
+        int rcvHwm = 10;           // tránh backlog lớn
+        int sndHwm = 10;
+        bool conflateSub = true;   // true: chỉ giữ message mới nhất (nếu libzmq hỗ trợ)
+    };
 
-    // Receive from server (PUB -> SUB)
-    zmq::socket_t sub(ctx, zmq::socket_type::sub);
-    sub.set(zmq::sockopt::subscribe, ""); // subscribe all
-    sub.connect("tcp://127.0.0.1:5555");
+    explicit ZmqClient(QObject* parent = nullptr);
+    ~ZmqClient() override;
 
-    // Send to server (PUSH -> PULL)
-    zmq::socket_t push(ctx, zmq::socket_type::push);
-    push.connect("tcp://127.0.0.1:5556");
+    void setConfig(const Config& cfg);
 
-    auto nextSend = std::chrono::steady_clock::now();
-    auto period100hz = std::chrono::milliseconds(10);
+    // Cập nhật payload “mới nhất” để IO thread gửi (thread-safe).
+    void setLatestTxPayload(const QByteArray& payload);
 
-    while (true) {
-        // 100Hz send
-        auto now = std::chrono::steady_clock::now();
-        if (now >= nextSend) {
-            nextSend += period100hz;
-            push.send(zmq::buffer("hello-from-client"), zmq::send_flags::dontwait);
-        }
+    // Optional: gửi ngay 1 message (enqueue) - nếu bạn cần burst.
+    void enqueueTx(const QByteArray& payload);
 
-        // non-blocking receive from server
-        zmq::message_t msg;
-        auto ok = sub.recv(msg, zmq::recv_flags::dontwait);
-        if (ok) {
-            std::cout << "RX from server: " << msg.to_string() << "\n";
-        }
+    void stop();
 
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
-    }
-}
+signals:
+    void connected();
+    void disconnected();
+    void rxMessage(const QByteArray& topic, const QByteArray& payload);
+    void txTick(qint64 monotonicMs); // báo mỗi tick gửi để app cập nhật data nếu muốn
+    void errorOccurred(const QString& err);
+
+protected:
+    void run() override;
+
+private:
+    void ioLoop();
+    void closeSockets();
+
+private:
+    Config m_cfg;
+
+    std::unique_ptr<zmq::context_t> m_ctx;
+    std::unique_ptr<zmq::socket_t>  m_sub;
+    std::unique_ptr<zmq::socket_t>  m_push;
+
+    std::atomic<bool> m_running{false};
+
+    // Latest payload mode (send fixed rate)
+    QMutex m_latestMutex;
+    QByteArray m_latestPayload;
+
+    // Queue mode (optional)
+    QMutex m_queueMutex;
+    QList<QByteArray> m_queue;
+};
