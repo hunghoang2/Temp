@@ -1,51 +1,165 @@
-// constants
-dt = 0.04;
-alpha = 0.75;
-beta  = 0.10;
-Tpred = 0.10;
+// =====================
+// Pan/Tilt Tracking Controller (anti-overshoot, no feedback)
+// Driver accepts absolute position command (deg).
+// Use same code for PAN and for TILT separately.
+// =====================
 
-Kp_high = 6.0; Kd_high = 1.0;
-Kp_low  = 3.0; Kd_low  = 0.6;
+#include <math.h>
+#include <stdbool.h>
 
-w_max = 60.0;
-a_max = 60.0;
-dw_max = a_max * dt;   // 2.4 deg/s per frame
-
-deadband = 0.08;       // deg
-gain_switch = 0.20;    // deg
-
-// states
-e = 0; edot = 0;
-w_prev = 0;
-theta_cmd = theta0;    // initial absolute pan angle (north reference)
-
-// each frame:
-e_meas = measured_angle_error_from_camera(); // deg
-
-// alpha-beta filter
-e_pred0 = e + edot*dt;
-r = e_meas - e_pred0;
-e = e_pred0 + alpha*r;
-edot = edot + (beta/dt)*r;
-
-// prediction
-e_pred = e + edot*Tpred;
-
-// gain scheduling + deadband
-if (fabs(e) < deadband) {
-  w_des = 0;
-} else {
-  if (fabs(e) < gain_switch) { Kp=Kp_low; Kd=Kd_low; }
-  else                       { Kp=Kp_high; Kd=Kd_high; }
-
-  w_des = Kp*e_pred + Kd*edot;
+static inline double clampd(double x, double lo, double hi) {
+    if (x < lo) return lo;
+    if (x > hi) return hi;
+    return x;
 }
 
-// limits (accel then speed)
-dw = clamp(w_des - w_prev, -dw_max, dw_max);
-w_cmd = clamp(w_prev + dw, -w_max, w_max);
-w_prev = w_cmd;
+static inline int sgn(double x) {
+    return (x > 0) - (x < 0);
+}
 
-// integrate to absolute position
-theta_cmd += w_cmd * dt;
-send_absolute_position(theta_cmd);
+typedef struct {
+    // alpha-beta filter states
+    double e;       // filtered error (deg)
+    double edot;    // filtered error rate (deg/s)
+
+    // command shaping states
+    double w_prev;      // previous commanded rate (deg/s)
+    double theta_cmd;   // absolute position command (deg)
+} AxisCtrl;
+
+typedef struct {
+    // timing
+    double dt; // seconds, e.g. 0.04 for 25fps
+
+    // alpha-beta filter
+    double alpha; // e.g. 0.75
+    double beta;  // e.g. 0.10
+
+    // prediction times
+    double Tpred_move;     // e.g. 0.10
+    double Tpred_static;   // e.g. 0.00
+
+    // thresholds
+    double edot_static_th; // e.g. 0.8  (deg/s)
+    double deadband;       // e.g. 0.10 (deg)
+    double soft_zone;      // e.g. 0.25 (deg)
+    double brake_zone;     // e.g. 0.20 (deg)
+
+    // gains (rate command = Kp*e_pred + Kd*edot)
+    double Kp_soft; // e.g. 1.5
+    double Kd_soft; // e.g. 0.8
+    double Kp_hard; // e.g. 4.0
+    double Kd_hard; // e.g. 1.0
+
+    // limits
+    double w_max;           // e.g. 60 (deg/s)
+    double a_max_move;      // e.g. 60 (deg/s^2)
+    double a_max_static;    // e.g. 20 (deg/s^2)
+} CtrlCfg;
+
+// Call once per axis at startup
+static inline void axis_init(AxisCtrl *ax, double theta0_deg) {
+    ax->e = 0.0;
+    ax->edot = 0.0;
+    ax->w_prev = 0.0;
+    ax->theta_cmd = theta0_deg; // absolute angle at start (north reference)
+}
+
+// One update step per frame for ONE axis (pan OR tilt).
+// Input: e_meas_deg = measured angular error from camera (deg), already signed.
+// Output: absolute position command (deg) to send to driver.
+static inline double axis_update(AxisCtrl *ax, const CtrlCfg *cfg, double e_meas_deg) {
+    const double dt = cfg->dt;
+
+    // ---- (1) Alpha-Beta filter to get e, edot ----
+    double e_pred0 = ax->e + ax->edot * dt;
+    double r = e_meas_deg - e_pred0;
+
+    ax->e    = e_pred0 + cfg->alpha * r;
+    ax->edot = ax->edot + (cfg->beta / dt) * r;
+
+    // ---- (2) Detect "static" (target almost not moving) ----
+    bool is_static = (fabs(ax->edot) < cfg->edot_static_th);
+
+    // ---- (3) Prediction (disable when static to avoid overshoot) ----
+    double Tpred = is_static ? cfg->Tpred_static : cfg->Tpred_move;
+    double e_pred = ax->e + ax->edot * Tpred;
+
+    // ---- (4) Gains scheduling + deadband ----
+    double w_des = 0.0;
+
+    if (fabs(ax->e) < cfg->deadband) {
+        // deadband: do nothing to kill jitter near center
+        w_des = 0.0;
+    } else {
+        double Kp, Kd;
+        if (fabs(ax->e) < cfg->soft_zone) {
+            Kp = cfg->Kp_soft;
+            Kd = cfg->Kd_soft;
+        } else {
+            Kp = cfg->Kp_hard;
+            Kd = cfg->Kd_hard;
+        }
+        w_des = Kp * e_pred + Kd * ax->edot;
+    }
+
+    // ---- (5) Accel limit (use smaller accel when static) ----
+    double a_max = is_static ? cfg->a_max_static : cfg->a_max_move;
+    double dw_max = a_max * dt;
+
+    // initial rate limiting (accel then speed)
+    double dw = clampd(w_des - ax->w_prev, -dw_max, +dw_max);
+    double w_cmd = ax->w_prev + dw;
+    w_cmd = clampd(w_cmd, -cfg->w_max, +cfg->w_max);
+
+    // ---- (6) Brake logic near center to prevent overshoot ----
+    // If we are close to center and current motion is going to cross over, cut rate.
+    // (sign(e) != sign(w_cmd)) means we are moving toward center; but near center, we should stop early.
+    if (fabs(ax->e) < cfg->brake_zone) {
+        if (sgn(ax->e) != sgn(w_cmd) && sgn(w_cmd) != 0) {
+            // strong brake: stop (or use 0.3*w_cmd if you want softer)
+            w_cmd = 0.0;
+        }
+    }
+
+    ax->w_prev = w_cmd;
+
+    // ---- (7) Integrate rate to absolute position command ----
+    ax->theta_cmd += w_cmd * dt;
+
+    return ax->theta_cmd;
+}
+
+/* =====================
+   Example usage (PAN + TILT)
+   =====================
+
+CtrlCfg cfg = {
+  .dt = 0.04,
+  .alpha = 0.75, .beta = 0.10,
+  .Tpred_move = 0.10, .Tpred_static = 0.00,
+  .edot_static_th = 0.8,
+  .deadband = 0.10,
+  .soft_zone = 0.25,
+  .brake_zone = 0.20,
+  .Kp_soft = 1.5, .Kd_soft = 0.8,
+  .Kp_hard = 4.0, .Kd_hard = 1.0,
+  .w_max = 60.0,
+  .a_max_move = 60.0,
+  .a_max_static = 20.0
+};
+
+AxisCtrl pan, tilt;
+axis_init(&pan,  pan_theta0);
+axis_init(&tilt, tilt_theta0);
+
+Every frame:
+  e_pan_meas_deg  = (u - 320) * 6.0 / 640.0;      // sign depends on your axis
+  e_tilt_meas_deg = -(v - 240) * 4.5 / 480.0;     // sign depends on your axis
+
+  pan_cmd_deg  = axis_update(&pan,  &cfg, e_pan_meas_deg);
+  tilt_cmd_deg = axis_update(&tilt, &cfg, e_tilt_meas_deg);
+
+  driver_send_abs(pan_cmd_deg, tilt_cmd_deg);
+
+*/
