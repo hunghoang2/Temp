@@ -1,38 +1,51 @@
-gst-launch-1.0 -v \
-  videotestsrc is-live=true pattern=smpte \
-  ! video/x-raw,width=1280,height=720,framerate=60/1 \
-  ! videoconvert \
-  ! jpegenc quality=85 idct-method=float \
-  ! rtpjpegpay \
-  ! tcpserversink host=0.0.0.0 port=5000
+// constants
+dt = 0.04;
+alpha = 0.75;
+beta  = 0.10;
+Tpred = 0.10;
 
+Kp_high = 6.0; Kd_high = 1.0;
+Kp_low  = 3.0; Kd_low  = 0.6;
 
-gst-launch-1.0 -v \
-  videotestsrc is-live=true \
-  ! video/x-raw,width=1280,height=720,framerate=60/1 \
-  ! videoconvert \
-  ! video/x-raw,format=YUY2 \
-  ! jpegenc quality=85 \
-  ! rtpjpegpay \
-  ! tcpserversink host=0.0.0.0 port=5000
+w_max = 60.0;
+a_max = 60.0;
+dw_max = a_max * dt;   // 2.4 deg/s per frame
 
-gst-launch-1.0 -v \
-  videotestsrc is-live=true pattern=smpte \
-  ! video/x-raw,width=1280,height=720,framerate=60/1 \
-  ! videoconvert \
-  ! video/x-raw,format=I420 \
-  ! jpegenc quality=85 \
-  ! rtpjpegpay \
-  ! tcpserversink host=0.0.0.0 port=5000
+deadband = 0.08;       // deg
+gain_switch = 0.20;    // deg
 
-gst-launch-1.0 videotestsrc is-live=true \
-! video/x-raw,framerate=60/1 \
-! fpsdisplaysink video-sink=autovideosink text-overlay=true
+// states
+e = 0; edot = 0;
+w_prev = 0;
+theta_cmd = theta0;    // initial absolute pan angle (north reference)
 
-gst-launch-1.0 -v \
-  tcpclientsrc host=<IP_SENDER> port=5000 \
-  ! application/x-rtp,media=video,encoding-name=JPEG,payload=26,clock-rate=90000 \
-  ! rtpjpegdepay \
-  ! jpegdec \
-  ! videoconvert \
-  ! autovideosink sync=false
+// each frame:
+e_meas = measured_angle_error_from_camera(); // deg
+
+// alpha-beta filter
+e_pred0 = e + edot*dt;
+r = e_meas - e_pred0;
+e = e_pred0 + alpha*r;
+edot = edot + (beta/dt)*r;
+
+// prediction
+e_pred = e + edot*Tpred;
+
+// gain scheduling + deadband
+if (fabs(e) < deadband) {
+  w_des = 0;
+} else {
+  if (fabs(e) < gain_switch) { Kp=Kp_low; Kd=Kd_low; }
+  else                       { Kp=Kp_high; Kd=Kd_high; }
+
+  w_des = Kp*e_pred + Kd*edot;
+}
+
+// limits (accel then speed)
+dw = clamp(w_des - w_prev, -dw_max, dw_max);
+w_cmd = clamp(w_prev + dw, -w_max, w_max);
+w_prev = w_cmd;
+
+// integrate to absolute position
+theta_cmd += w_cmd * dt;
+send_absolute_position(theta_cmd);
