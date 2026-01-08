@@ -1,115 +1,64 @@
-// ===== parameters =====
-double dt = 0.04;
+typedef struct {
+    double theta_est, omega_est;
+    double theta_set;
+    double theta_set_prev;
+    double theta_meas_prev;
+    int    inited;
+} Tracker;
 
-// camera deadband
-double e_db    = 0.10;   // deg (<=0.3 requirement)
-double e_stall = 0.60;   // deg (stall detect threshold)
+double clampd(double x,double lo,double hi){ if(x<lo) return lo; if(x>hi) return hi; return x; }
 
-// encoder motion detect
-double w_min = 0.20;     // deg/s  (consider "not moving")
-int    stall_N = 8;      // frames (~0.32s) before declaring stall
+void tracker_init(Tracker* t, double theta0){
+    t->theta_est = theta0;
+    t->omega_est = 0.0;
+    t->theta_set = theta0;
+    t->theta_set_prev = theta0;
+    t->theta_meas_prev = theta0;
+    t->inited = 1;
+}
 
-// breakaway behavior
-double kick_deg = 0.8;   // 0.5~1.5 deg
-int    kick_max_frames = 6;
+double tracker_step(
+    Tracker* t,
+    double dt,
+    double theta_enc,     // deg
+    double e_cam,         // deg
+    // params
+    double e_db,
+    double alpha, double beta,
+    double w_static_th,
+    double Tlead_move,
+    double w_sp_max_static,
+    double w_sp_max_move
+){
+    if (!t->inited) tracker_init(t, theta_enc);
 
-// setpoint rate limit (per frame)
-double w_sp_max_run   = 30.0;  // deg/s
-double w_sp_max_brake = 10.0;  // deg/s
-double max_step_run   = w_sp_max_run   * dt;
-double max_step_brake = w_sp_max_brake * dt;
-
-// prediction for moving target (camera latency only, NOT 0.68s stiction)
-double Tlead_move = 0.12;   // 0.08~0.20
-double w_static_th = 0.5;   // deg/s (target abs angular rate)
-
-// alpha-beta on absolute target angle
-double alpha = 0.75;
-double beta  = 0.10;
-
-// ===== states =====
-double theta_set_prev;
-double theta_enc_prev;
-double omega_enc;
-
-int stall_cnt = 0;
-int kick_cnt = 0;
-
-double theta_tar_est = 0, omega_tar_est = 0;
-
-// clamp helper
-double clamp(double x,double lo,double hi){ if(x<lo) return lo; if(x>hi) return hi; return x; }
-int sgn(double x){ return (x>0)-(x<0); }
-
-void update_25hz(double e_cam, double theta_enc) {
-
-    // 0) encoder speed estimate
-    omega_enc = (theta_enc - theta_enc_prev) / dt;
-    theta_enc_prev = theta_enc;
-
-    // 1) deadband: hold
+    // deadband: hold to kill jitter
     if (fabs(e_cam) < e_db) {
-        stall_cnt = 0;
-        kick_cnt = 0;
-        send_setpoint(theta_set_prev);
-        return;
+        return t->theta_set_prev;
     }
 
-    // 2) estimate absolute target angle measurement
-    double theta_tar_meas = theta_enc + e_cam;
+    // measurement: absolute target angle
+    double theta_meas = theta_enc + e_cam;
 
-    // 3) alpha-beta on theta_target (abs)
-    double theta_pred = theta_tar_est + omega_tar_est * dt;
-    double r = theta_tar_meas - theta_pred;
-    theta_tar_est = theta_pred + alpha * r;
-    omega_tar_est = omega_tar_est + (beta/dt) * r;
+    // alpha-beta on theta_target
+    double theta_pred0 = t->theta_est + t->omega_est * dt;
+    double r = theta_meas - theta_pred0;
+    t->theta_est = theta_pred0 + alpha * r;
+    t->omega_est = t->omega_est + (beta/dt) * r;
 
-    // 4) moving/static (of target)
-    double Tlead = (fabs(omega_tar_est) < w_static_th) ? 0.0 : Tlead_move;
-    double theta_tar_pred = theta_tar_est + omega_tar_est * Tlead;
+    // adaptive mode
+    int moving = (fabs(t->omega_est) >= w_static_th);
 
-    // 5) stall detect: "motor not moving" while error is big
-    bool motor_stuck = (fabs(omega_enc) < w_min) && (fabs(e_cam) > e_stall);
+    // lead prediction (only when moving)
+    double theta_pred = t->theta_est + (moving ? t->omega_est * Tlead_move : 0.0);
 
-    if (motor_stuck) stall_cnt++; else stall_cnt = 0;
+    // rate-limited absolute setpoint
+    double w_sp_max = moving ? w_sp_max_move : w_sp_max_static;
+    double max_step = w_sp_max * dt;
 
-    bool in_stall = (stall_cnt >= stall_N) || (kick_cnt > 0);
+    double step = clampd(theta_pred - t->theta_set_prev, -max_step, +max_step);
+    t->theta_set = t->theta_set_prev + step;
 
-    // 6) choose setpoint
-    double theta_set = theta_set_prev;
-
-    if (!in_stall) {
-        // RUN mode: chase predicted target, but rate-limited
-        double step = clamp(theta_tar_pred - theta_set_prev, -max_step_run, +max_step_run);
-        theta_set = theta_set_prev + step;
-    } else {
-        // BREAKAWAY mode:
-        // (a) keep setpoint close to encoder to avoid windup
-        // (b) apply small kick steps until encoder starts moving
-        // (c) once moving, exit kick mode
-
-        if (kick_cnt == 0) kick_cnt = kick_max_frames;
-
-        // base command: do NOT drift far away
-        double base = theta_enc + clamp(e_cam, -2.0, +2.0); // optional clamp
-
-        // rate limit in brake-like manner
-        double step = clamp(base - theta_set_prev, -max_step_brake, +max_step_brake);
-        theta_set = theta_set_prev + step;
-
-        // kick to overcome stiction (only while still not moving)
-        if (fabs(omega_enc) < w_min && kick_cnt > 0) {
-            theta_set += sgn(e_cam) * kick_deg;
-            kick_cnt--;
-        }
-
-        // exit stall when motor starts moving
-        if (fabs(omega_enc) >= w_min) {
-            stall_cnt = 0;
-            kick_cnt = 0;
-        }
-    }
-
-    theta_set_prev = theta_set;
-    send_setpoint(theta_set);
+    t->theta_set_prev = t->theta_set;
+    return t->theta_set;
 }
