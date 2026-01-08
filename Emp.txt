@@ -1,111 +1,92 @@
-#include <math.h>
-
-static inline double wrap360(double a_deg) {
-    double r = fmod(a_deg, 360.0);
-    if (r < 0) r += 360.0;
-    return r; // [0,360)
-}
-
-// shortest signed difference from "from" to "to" in degrees, result in (-180,180]
-static inline double ang_diff_deg(double to_deg, double from_deg) {
-    double d = wrap360(to_deg) - wrap360(from_deg);
-    if (d > 180.0) d -= 360.0;
-    if (d <= -180.0) d += 360.0;
-    return d;
-}
-
-
 typedef struct {
-    int inited;
-    double enc_prev_wrapped;   // last raw encoder [0..360)
-    double enc_cont;           // unwrapped continuous encoder angle
-} PanUnwrap;
+    /* ===== CONFIG (set once or tune runtime) ===== */
+    double dt;                 // frame time (s), e.g. 0.04
 
-static inline void pan_unwrap_init(PanUnwrap* u, double enc0_wrapped) {
-    u->inited = 1;
-    u->enc_prev_wrapped = wrap360(enc0_wrapped);
-    u->enc_cont = u->enc_prev_wrapped; // start continuous at first reading
-}
+    // deadband & mode
+    double e_db;               // deadband in deg (e.g. 0.10)
+    double w_static_th;        // deg/s threshold to detect moving target
 
-// call every frame
-static inline double pan_unwrap_update(PanUnwrap* u, double enc_wrapped) {
-    enc_wrapped = wrap360(enc_wrapped);
+    // alpha-beta filter
+    double alpha;              // e.g. 0.75
+    double beta;               // e.g. 0.10
 
-    if (!u->inited) {
-        pan_unwrap_init(u, enc_wrapped);
-        return u->enc_cont;
-    }
+    // lead (prediction)
+    double Tlead_move;         // e.g. 0.14 s
 
-    // delta in (-180, 180]
-    double d = ang_diff_deg(enc_wrapped, u->enc_prev_wrapped);
+    // setpoint rate limit
+    double w_sp_max_static;    // deg/s (e.g. 10)
+    double w_sp_max_move;      // deg/s (e.g. 35)
 
-    u->enc_cont += d;                 // continuous update
-    u->enc_prev_wrapped = enc_wrapped;
-    return u->enc_cont;
-}
+    /* ===== STATE ===== */
+    int    inited;
 
-typedef struct {
-    int inited;
-    PanUnwrap unwrap;
+    // encoder unwrap
+    double enc_prev_wrapped;   // last encoder raw [0..360)
+    double enc_cont;           // continuous encoder angle
 
     // target angle estimate (continuous)
-    double theta_est;
-    double omega_est;
+    double theta_est;          // deg
+    double omega_est;          // deg/s
 
-    // setpoint we send (continuous)
-    double theta_set;
+    // output setpoint (continuous)
+    double theta_set;          // deg
 } PanTracker;
 
-static inline void pan_tracker_init(PanTracker* t, double enc0_wrapped) {
-    t->inited = 1;
-    pan_unwrap_init(&t->unwrap, enc0_wrapped);
 
-    double enc0_cont = t->unwrap.enc_cont;
-    t->theta_est = enc0_cont;
+void pan_tracker_init(PanTracker* t, double enc_wrapped_deg)
+{
+    t->inited = 1;
+
+    t->enc_prev_wrapped = wrap360(enc_wrapped_deg);
+    t->enc_cont         = t->enc_prev_wrapped;
+
+    t->theta_est = t->enc_cont;
     t->omega_est = 0.0;
-    t->theta_set = enc0_cont;
+
+    t->theta_set = t->enc_cont;
 }
 
-// returns setpoint to send in [0..360)
 double pan_tracker_step(
     PanTracker* t,
-    double dt,                  // 0.04
-    double enc_wrapped,          // [0..360)
-    double e_cam_deg,            // signed error in deg (pan)
-    // params
-    double e_db,                // deadband e.g. 0.10
-    double alpha, double beta,  // 0.75, 0.10
-    double w_static_th,         // 0.7 deg/s
-    double Tlead_move,          // 0.14 s
-    double w_sp_max_static,     // 10 deg/s
-    double w_sp_max_move        // 35 deg/s
+    double enc_wrapped_deg,
+    double e_cam_deg
 ) {
-    if (!t->inited) pan_tracker_init(t, enc_wrapped);
-
-    // 0) unwrap encoder to continuous
-    double enc_cont = pan_unwrap_update(&t->unwrap, enc_wrapped);
-
-    // 1) deadband: hold setpoint (helps jitter when static)
-    if (fabs(e_cam_deg) < e_db) {
+    if (!t->inited) {
+        pan_tracker_init(t, enc_wrapped_deg);
         return wrap360(t->theta_set);
     }
 
-    // 2) measurement of absolute target angle (continuous)
-    double theta_meas = enc_cont + e_cam_deg;
+    /* ===== 0) UNWRAP ENCODER ===== */
+    enc_wrapped_deg = wrap360(enc_wrapped_deg);
+    double d_enc = ang_diff_deg(enc_wrapped_deg, t->enc_prev_wrapped);
+    t->enc_cont += d_enc;
+    t->enc_prev_wrapped = enc_wrapped_deg;
 
-    // 3) alpha-beta on theta_target (continuous)
-    double theta_pred0 = t->theta_est + t->omega_est * dt;
+    /* ===== 1) DEADZONE (STATIC STABILITY) ===== */
+    if (fabs(e_cam_deg) < t->e_db) {
+        return wrap360(t->theta_set);
+    }
+
+    /* ===== 2) TARGET ANGLE MEASUREMENT (CONTINUOUS) ===== */
+    double theta_meas = t->enc_cont + e_cam_deg;
+
+    /* ===== 3) ALPHA–BETA FILTER ===== */
+    double theta_pred0 = t->theta_est + t->omega_est * t->dt;
     double r = theta_meas - theta_pred0;
-    t->theta_est = theta_pred0 + alpha * r;
-    t->omega_est = t->omega_est + (beta / dt) * r;
 
-    // 4) adaptive lead
-    int moving = (fabs(t->omega_est) >= w_static_th);
-    double theta_pred = t->theta_est + (moving ? t->omega_est * Tlead_move : 0.0);
+    t->theta_est  = theta_pred0 + t->alpha * r;
+    t->omega_est += (t->beta / t->dt) * r;
 
-    // 5) rate limit setpoint update (continuous)
-    double w_sp_max = moving ? w_sp_max_move : w_sp_max_static;
-    double max_step = w_sp_max * dt;
+    /* ===== 4) ADAPTIVE MODE ===== */
+    int moving = (fabs(t->omega_est) >= t->w_static_th);
+
+    /* ===== 5) LEAD PREDICTION ===== */
+    double theta_pred = t->theta_est +
+                        (moving ? t->omega_est * t->Tlead_move : 0.0);
+
+    /* ===== 6) RATE-LIMITED SETPOINT UPDATE ===== */
+    double w_sp_max = moving ? t->w_sp_max_move : t->w_sp_max_static;
+    double max_step = w_sp_max * t->dt;
 
     double step = theta_pred - t->theta_set;
     if (step >  max_step) step =  max_step;
@@ -113,6 +94,7 @@ double pan_tracker_step(
 
     t->theta_set += step;
 
-    // 6) send wrapped setpoint to PLC
+    /* ===== 7) OUTPUT (WRAPPED) ===== */
     return wrap360(t->theta_set);
 }
+
