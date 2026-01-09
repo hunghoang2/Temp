@@ -1,144 +1,47 @@
-typedef struct {
-    /* ===== CONFIG ===== */
-    double dt;
+dt = 0.04;
 
-    // deadband hysteresis
-    double e_in;        // deg: enter hold, e.g. 0.10
-    double e_out;       // deg: exit hold,  e.g. 0.18
-    int    hold_frames; // e.g. 5~10 frames
+e_db = 0.15°          // deadband (≈16 px)
+e_soft = 0.35°        // vùng phanh mềm
 
-    // alpha-beta
-    double alpha, beta;
-    double w_static_th;
-    double Tlead_move;
+K_static = 0.20
+K_move   = 0.45
 
-    // rate limits
-    double w_sp_max_static;
-    double w_sp_max_move;
-    double w_sp_min_near;    // deg/s when very near, e.g. 2~5
-    double e_soft;           // deg: near-center range, e.g. 0.30
-
-    // encoder LPF
-    double enc_lpf_a;
-
-    /* ===== STATE ===== */
-    int inited;
-
-    // unwrap
-    double enc_prev_wrapped;
-    double enc_cont;
-    double enc_f;
-
-    // target estimate
-    double theta_est, omega_est;
-
-    // setpoint
-    double theta_set;
-
-    // hold state
-    int hold_mode;
-    int hold_cnt;
-} PanTracker;
+delta_max_static = 0.3°   // ~7.5°/s
+delta_max_move   = 1.0°   // ~25°/s
 
 
+// STATE
+double theta_cmd;
+double e_prev = 0;
 
-#include <math.h>
-
-static inline double wrap360(double a){
-    double r = fmod(a, 360.0);
-    if(r < 0) r += 360.0;
-    return r;
-}
-static inline double ang_diff_deg(double to, double from){
-    double d = wrap360(to) - wrap360(from);
-    if(d > 180.0) d -= 360.0;
-    if(d <= -180.0) d += 360.0;
-    return d;
-}
-static inline double clampd(double x,double lo,double hi){
-    if(x<lo) return lo; if(x>hi) return hi; return x;
-}
-
-void pan_tracker_init(PanTracker* t, double enc_wrapped_deg){
-    t->inited = 1;
-    t->enc_prev_wrapped = wrap360(enc_wrapped_deg);
-    t->enc_cont = t->enc_prev_wrapped;
-    t->enc_f    = t->enc_cont;
-
-    t->theta_est = t->enc_cont;
-    t->omega_est = 0.0;
-    t->theta_set = t->enc_cont;
-
-    t->hold_mode = 0;
-    t->hold_cnt  = 0;
-}
-
-double pan_tracker_step(PanTracker* t, double enc_wrapped_deg, double e_cam_deg)
+// each frame
+void track_step(double e_cam)
 {
-    if(!t->inited){
-        pan_tracker_init(t, enc_wrapped_deg);
-        return wrap360(t->theta_set);
+    double ae = fabs(e_cam);
+
+    // 1) Deadband + hold
+    if (ae < e_db) {
+        send(theta_cmd);
+        return;
     }
 
-    // --- unwrap encoder ---
-    enc_wrapped_deg = wrap360(enc_wrapped_deg);
-    double d_enc = ang_diff_deg(enc_wrapped_deg, t->enc_prev_wrapped);
-    t->enc_cont += d_enc;
-    t->enc_prev_wrapped = enc_wrapped_deg;
+    // 2) Detect moving target (approx)
+    double edot = (e_cam - e_prev) / dt;
+    e_prev = e_cam;
+    bool moving = fabs(edot) > 0.5;   // deg/s
 
-    // --- LPF encoder on continuous ---
-    double a = t->enc_lpf_a;
-    t->enc_f = a*t->enc_f + (1.0-a)*t->enc_cont;
+    // 3) Gain scheduling
+    double K = moving ? K_move : K_static;
+    double delta_max = moving ? delta_max_move : delta_max_static;
 
-    double ae = fabs(e_cam_deg);
+    // 4) Soft approach near center
+    double scale = clamp(ae / e_soft, 0.0, 1.0);
+    double delta = K * e_cam * scale;
 
-    // --- hysteresis + hold timer ---
-    if (t->hold_mode) {
-        if (ae > t->e_out) {
-            t->hold_mode = 0;
-            t->hold_cnt = 0;
-        } else {
-            // keep holding for a minimum time
-            if (t->hold_cnt > 0) t->hold_cnt--;
-            return wrap360(t->theta_set); // freeze
-        }
-    } else {
-        if (ae < t->e_in) {
-            t->hold_mode = 1;
-            t->hold_cnt  = t->hold_frames;
-            return wrap360(t->theta_set); // freeze immediately
-        }
-    }
+    // 5) Limit increment
+    delta = clamp(delta, -delta_max, +delta_max);
 
-    // --- measurement of absolute target angle ---
-    double theta_meas = t->enc_f + e_cam_deg;
-
-    // --- alpha-beta on theta_target ---
-    double theta_pred0 = t->theta_est + t->omega_est * t->dt;
-    double r = theta_meas - theta_pred0;
-    t->theta_est  = theta_pred0 + t->alpha * r;
-    t->omega_est += (t->beta / t->dt) * r;
-
-    // --- adaptive moving/static ---
-    int moving = (fabs(t->omega_est) >= t->w_static_th);
-
-    // --- near-center gating: disable lead when close ---
-    double Tlead = 0.0;
-    if (moving && ae > t->e_soft) {
-        Tlead = t->Tlead_move;
-    }
-    double theta_pred = t->theta_est + t->omega_est * Tlead;
-
-    // --- soft approach: dynamic speed limit based on |e| ---
-    double w_base = moving ? t->w_sp_max_move : t->w_sp_max_static;
-    double ratio = clampd(ae / t->e_soft, 0.0, 1.0);
-    double w_lim = t->w_sp_min_near + (w_base - t->w_sp_min_near) * ratio;
-
-    double max_step = w_lim * t->dt;
-
-    // --- rate-limited setpoint update ---
-    double step = clampd(theta_pred - t->theta_set, -max_step, +max_step);
-    t->theta_set += step;
-
-    return wrap360(t->theta_set);
+    // 6) Update command
+    theta_cmd += delta;
+    send(theta_cmd);
 }
