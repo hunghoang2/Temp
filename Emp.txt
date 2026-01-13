@@ -1,47 +1,147 @@
-dt = 0.04;
+#include <opencv2/opencv.hpp>
+#include <iostream>
+#include <algorithm>
 
-e_db = 0.15°          // deadband (≈16 px)
-e_soft = 0.35°        // vùng phanh mềm
+static inline float clampf(float v, float lo, float hi) {
+    return std::max(lo, std::min(hi, v));
+}
 
-K_static = 0.20
-K_move   = 0.45
-
-delta_max_static = 0.3°   // ~7.5°/s
-delta_max_move   = 1.0°   // ~25°/s
-
-
-// STATE
-double theta_cmd;
-double e_prev = 0;
-
-// each frame
-void track_step(double e_cam)
-{
-    double ae = fabs(e_cam);
-
-    // 1) Deadband + hold
-    if (ae < e_db) {
-        send(theta_cmd);
-        return;
+class DigitalZoom {
+public:
+    DigitalZoom(float alpha = 0.12f,
+                float zoomMin = 1.0f,
+                float zoomMax = 8.0f,
+                int interpolation = cv::INTER_LINEAR,
+                bool enableSharpen = false)
+        : alpha_(alpha),
+          zoomMin_(zoomMin),
+          zoomMax_(zoomMax),
+          interp_(interpolation),
+          sharpen_(enableSharpen),
+          z_(1.0f)
+    {
+        // Sharpen kernel nhẹ (rẻ CPU)
+        sharpKernel_ = (cv::Mat_<float>(3,3) <<
+            0,  -1,  0,
+           -1,   5, -1,
+            0,  -1,  0
+        );
     }
 
-    // 2) Detect moving target (approx)
-    double edot = (e_cam - e_prev) / dt;
-    e_prev = e_cam;
-    bool moving = fabs(edot) > 0.5;   // deg/s
+    // frame: input BGR, zoomTarget: mong muốn (1..8)
+    cv::Mat apply(const cv::Mat& frame, float zoomTarget) {
+        CV_Assert(!frame.empty());
+        CV_Assert(frame.type() == CV_8UC3 || frame.type() == CV_8UC1);
 
-    // 3) Gain scheduling
-    double K = moving ? K_move : K_static;
-    double delta_max = moving ? delta_max_move : delta_max_static;
+        zoomTarget = clampf(zoomTarget, zoomMin_, zoomMax_);
 
-    // 4) Soft approach near center
-    double scale = clamp(ae / e_soft, 0.0, 1.0);
-    double delta = K * e_cam * scale;
+        // Smooth zoom (LPF)
+        z_ = z_ + alpha_ * (zoomTarget - z_);
+        z_ = clampf(z_, zoomMin_, zoomMax_);
 
-    // 5) Limit increment
-    delta = clamp(delta, -delta_max, +delta_max);
+        if (z_ <= 1.001f) {
+            return frame; // return view (no copy)
+        }
 
-    // 6) Update command
-    theta_cmd += delta;
-    send(theta_cmd);
+        const int w = frame.cols;
+        const int h = frame.rows;
+
+        // ROI size
+        int newW = static_cast<int>(w / z_);
+        int newH = static_cast<int>(h / z_);
+
+        // đảm bảo ROI tối thiểu (zoom 8x: 640/8=80, ok)
+        newW = std::max(2, newW);
+        newH = std::max(2, newH);
+
+        // Center crop
+        int x1 = (w - newW) / 2;
+        int y1 = (h - newH) / 2;
+
+        // clamp (an toàn)
+        x1 = std::max(0, std::min(w - newW, x1));
+        y1 = std::max(0, std::min(h - newH, y1));
+
+        cv::Rect roi(x1, y1, newW, newH);
+        cv::Mat cropped = frame(roi);
+
+        cv::Mat out;
+        cv::resize(cropped, out, frame.size(), 0, 0, interp_);
+
+        if (sharpen_) {
+            cv::Mat sharp;
+            cv::filter2D(out, sharp, -1, sharpKernel_);
+            return sharp;
+        }
+        return out;
+    }
+
+    float currentZoom() const { return z_; }
+
+private:
+    float alpha_;
+    float zoomMin_;
+    float zoomMax_;
+    int interp_;
+    bool sharpen_;
+    float z_;
+    cv::Mat sharpKernel_;
+};
+
+int main(int argc, char** argv) {
+    // Mở camera hoặc video
+    cv::VideoCapture cap;
+    if (argc > 1) {
+        cap.open(argv[1]); // file video
+    } else {
+        cap.open(0); // camera
+    }
+    if (!cap.isOpened()) {
+        std::cerr << "Cannot open video source\n";
+        return 1;
+    }
+
+    // Set 640x480 nếu là camera
+    cap.set(cv::CAP_PROP_FRAME_WIDTH, 640);
+    cap.set(cv::CAP_PROP_FRAME_HEIGHT, 480);
+    cap.set(cv::CAP_PROP_FPS, 25);
+
+    // alpha ~ 0.10-0.15 cho 25fps: đủ mượt mà không lag
+    DigitalZoom zoomer(0.12f, 1.0f, 8.0f, cv::INTER_LINEAR, false);
+
+    float zoomTarget = 1.0f;
+
+    const float step = 0.25f; // bước zoom (bạn có thể đổi 0.1)
+    const int waitMs = 1;
+
+    cv::Mat frame;
+    while (true) {
+        if (!cap.read(frame) || frame.empty()) break;
+
+        // xử lý zoom
+        cv::Mat out = zoomer.apply(frame, zoomTarget);
+
+        // overlay text
+        std::string txt = "Zoom target=" + cv::format("%.2f", zoomTarget) +
+                          "  current=" + cv::format("%.2f", zoomer.currentZoom()) +
+                          "  (+/- to zoom, r reset, ESC quit)";
+        cv::putText(out, txt, cv::Point(10, 25),
+                    cv::FONT_HERSHEY_SIMPLEX, 0.6, cv::Scalar(255,255,255), 2);
+
+        cv::imshow("Digital Zoom (center)", out);
+
+        int key = cv::waitKey(waitMs) & 0xFF;
+        if (key == 27) break;                 // ESC
+        if (key == '+' || key == '=') {       // zoom in
+            zoomTarget = clampf(zoomTarget + step, 1.0f, 8.0f);
+        } else if (key == '-' || key == '_') { // zoom out
+            zoomTarget = clampf(zoomTarget - step, 1.0f, 8.0f);
+        } else if (key == 'r' || key == 'R') { // reset
+            zoomTarget = 1.0f;
+        }
+    }
+
+    cap.release();
+    cv::destroyAllWindows();
+    return 0;
 }
