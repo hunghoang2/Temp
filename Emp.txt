@@ -1,12 +1,27 @@
-double computeAngleDeg(
-    double angular_accel_deg_s2, // gia tốc góc (deg/s^2)
-    double dt,                   // thời gian (s)
-    double alpha_max = 10.0       // giới hạn gia tốc góc
+struct AngularState {
+    double theta = 0.0; // deg
+    double omega = 0.0; // deg/s
+};
+
+void updateAngularLimited(
+    AngularState& s,
+    double alpha_deg_s2, // gia tốc góc
+    double dt,
+    double alpha_max = 10.0,
+    double omega_max = 60.0
 )
 {
-    angular_accel_deg_s2 =
-        std::clamp(angular_accel_deg_s2, -alpha_max, alpha_max);
+    // 1. Clamp gia tốc
+    alpha_deg_s2 =
+        std::clamp(alpha_deg_s2, -alpha_max, alpha_max);
 
-    // θ = 1/2 * α * t²
-    return 0.5 * angular_accel_deg_s2 * dt * dt;
+    // 2. Tích phân ra vận tốc
+    s.omega += alpha_deg_s2 * dt;
+
+    // 3. Clamp vận tốc (QUAN TRỌNG)
+    s.omega =
+        std::clamp(s.omega, -omega_max, omega_max);
+
+    // 4. Tích phân ra góc
+    s.theta += s.omega * dt;
 }
