@@ -1,62 +1,16 @@
-struct AngularState {
-    double theta = 0.0; // deg
-    double omega = 0.0; // deg/s
-};
-
-void updateAngularLimited(
-    AngularState& s,
-    double alpha_deg_s2, // gia tốc góc
-    double dt,
-    double alpha_max = 10.0,
-    double omega_max = 60.0
-)
+double angleAtTime(double t)
 {
-    // 1. Clamp gia tốc
-    alpha_deg_s2 =
-        std::clamp(alpha_deg_s2, -alpha_max, alpha_max);
+    const double alpha = 6.0;
+    const double omega_max = 60.0;
+    const double t_max = omega_max / alpha; // 10s
 
-    // 2. Tích phân ra vận tốc
-    s.omega += alpha_deg_s2 * dt;
-
-    // 3. Clamp vận tốc (QUAN TRỌNG)
-    s.omega =
-        std::clamp(s.omega, -omega_max, omega_max);
-
-    // 4. Tích phân ra góc
-    s.theta += s.omega * dt;
-}
-
-
-
-
-
-#include <algorithm>
-#include <cmath>
-
-struct AngularState {
-    double theta = 0.0; // góc hiện tại (deg) – CỘNG DỒN
-    double omega = 0.0; // tốc độ góc (deg/s)
-};
-
-void updateAngleAccumulated(
-    AngularState& s,
-    double alpha_input_deg_s2, // gia tốc góc mong muốn
-    double dt,                 // delta time (s)
-    double alpha_max = 10.0,   // giới hạn gia tốc
-    double omega_max = 60.0    // giới hạn tốc độ góc
-)
-{
-    // 1. Clamp gia tốc
-    double alpha =
-        std::clamp(alpha_input_deg_s2, -alpha_max, alpha_max);
-
-    // 2. Tích phân ra vận tốc
-    s.omega += alpha * dt;
-
-    // 3. Clamp vận tốc góc
-    s.omega =
-        std::clamp(s.omega, -omega_max, omega_max);
-
-    // 4. Tích phân ra góc (CỘNG DỒN)
-    s.theta += s.omega * dt;
+    if (t <= t_max)
+    {
+        return 0.5 * alpha * t * t; // 3*t^2
+    }
+    else
+    {
+        return 0.5 * alpha * t_max * t_max
+             + omega_max * (t - t_max);
+    }
 }
