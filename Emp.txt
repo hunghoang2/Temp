@@ -1,42 +1,11 @@
-struct TiltMotion
+float wrapTilt(float startTilt, float totalOffset)
 {
-    double angle = 0.0;     // góc hiện tại (độ)
-    double omega = 0.0;     // vận tốc góc (độ/s)
-    int direction = 1;      // +1: lên, -1: xuống
+    const float period = 180.0f; // 0→90→0
+    float x = fmod(startTilt + totalOffset, period);
+    if (x < 0) x += period;
 
-    const double alpha = 6.0;        // độ/s^2
-    const double omega_max = 60.0;   // độ/s
-    const double min_angle = 0.0;
-    const double max_angle = 90.0;
-
-    void update(double dt)
-    {
-        // 1. tăng vận tốc theo hướng quay
-        omega += direction * alpha * dt;
-
-        // 2. giới hạn vận tốc
-        if (omega > omega_max)  omega = omega_max;
-        if (omega < -omega_max) omega = -omega_max;
-
-        // 3. cập nhật góc (vận tốc trung bình đơn giản)
-        double angle_new = angle + omega * dt;
-
-        // 4. xử lý chạm biên
-        if (angle_new >= max_angle)
-        {
-            angle = max_angle;
-            direction = -1;
-            omega = 0.0;   // reset để quay mượt
-        }
-        else if (angle_new <= min_angle)
-        {
-            angle = min_angle;
-            direction = 1;
-            omega = 0.0;
-        }
-        else
-        {
-            angle = angle_new;
-        }
-    }
-};
+    if (x <= 90.0f)
+        return x;
+    else
+        return 180.0f - x;
+}
