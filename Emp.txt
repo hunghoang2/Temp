@@ -2,10 +2,18 @@ float wrapTilt(float startTilt, float totalOffset)
 {
     const float period = 180.0f; // 0→90→0
     float x = fmod(startTilt + totalOffset, period);
-    if (x < 0) x += period;
 
+    if (x < 0.0f)
+        x += period;
+
+    float tilt;
     if (x <= 90.0f)
-        return x;
+        tilt = x;
     else
-        return 180.0f - x;
+        tilt = 180.0f - x;
+
+    // clamp cứng theo yêu cầu
+    if (tilt < 0.0f)   return 0.0f;
+    if (tilt > 90.0f)  return 90.0f;
+    return tilt;
 }
