@@ -1,19 +1,25 @@
-float wrapTilt(float startTilt, float totalOffset)
+cv::Mat processThermal(const cv::Mat& rgbFrame)
 {
-    const float period = 180.0f; // 0→90→0
-    float x = fmod(startTilt + totalOffset, period);
+    static double smoothMin = 0, smoothMax = 255;
+    const double alpha = 0.05;
 
-    if (x < 0.0f)
-        x += period;
+    cv::Mat gray;
+    cv::cvtColor(rgbFrame, gray, cv::COLOR_BGR2GRAY);
 
-    float tilt;
-    if (x <= 90.0f)
-        tilt = x;
-    else
-        tilt = 180.0f - x;
+    double curMin, curMax;
+    cv::minMaxLoc(gray, &curMin, &curMax);
 
-    // clamp cứng theo yêu cầu
-    if (tilt < 0.0f)   return 0.0f;
-    if (tilt > 90.0f)  return 90.0f;
-    return tilt;
+    smoothMin = (1 - alpha) * smoothMin + alpha * curMin;
+    smoothMax = (1 - alpha) * smoothMax + alpha * curMax;
+
+    cv::Mat norm;
+    gray.convertTo(norm, CV_8U, 255.0/(smoothMax - smoothMin),
+                   -smoothMin * 255.0/(smoothMax - smoothMin));
+
+    cv::bitwise_not(norm, norm);
+
+    cv::Mat colored;
+    cv::applyColorMap(norm, colored, cv::COLORMAP_INFERNO);
+
+    return colored;
 }
