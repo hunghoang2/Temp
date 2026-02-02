@@ -323,3 +323,81 @@ private:
             templateImg = 0.9f*templateImg + 0.1f*small;
     }
 };
+
+
+class ThermalBlobValidator {
+public:
+    void init(const cv::Mat& frame, const cv::Rect& box)
+    {
+        cv::Rect roi = safe(box, frame.size());
+        analyze(frame(roi), true);
+        inited = true;
+    }
+
+    bool validate(const cv::Mat& frame, const cv::Rect& box)
+    {
+        if(!inited) return false;
+
+        cv::Rect roi = safe(box, frame.size());
+        BlobFeat f = analyze(frame(roi), false);
+
+        int fail = 0;
+
+        if(f.brightRatio < ref.brightRatio * 0.5f) fail++;
+        if(f.blobArea < ref.blobArea * 0.4f ||
+           f.blobArea > ref.blobArea * 2.5f) fail++;
+        if(f.compactness < 0.4f) fail++;
+
+        float centerDist = cv::norm(f.centroid - cv::Point2f(roi.width/2, roi.height/2));
+        if(centerDist > roi.width*0.3f) fail++;
+
+        return fail < 2;
+    }
+
+private:
+    struct BlobFeat {
+        float brightRatio;
+        float blobArea;
+        float compactness;
+        cv::Point2f centroid;
+    } ref;
+
+    bool inited=false;
+
+    BlobFeat analyze(const cv::Mat& roi, bool store=false)
+    {
+        BlobFeat f{};
+        cv::Mat bin;
+
+        double meanVal = cv::mean(roi)[0];
+        cv::threshold(roi, bin, meanVal+5, 255, cv::THRESH_BINARY);
+
+        f.brightRatio = float(cv::countNonZero(bin)) / (roi.total());
+
+        std::vector<std::vector<cv::Point>> contours;
+        cv::findContours(bin, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
+
+        if(contours.empty()) return f;
+
+        int idx = 0; double maxA=0;
+        for(int i=0;i<contours.size();i++){
+            double a=cv::contourArea(contours[i]);
+            if(a>maxA){maxA=a; idx=i;}
+        }
+
+        f.blobArea = maxA;
+
+        double peri = cv::arcLength(contours[idx],true);
+        f.compactness = (4*CV_PI*maxA)/(peri*peri+1e-5);
+
+        cv::Moments m = cv::moments(contours[idx]);
+        f.centroid = {float(m.m10/m.m00), float(m.m01/m.m00)};
+
+        if(store) ref = f;
+        return f;
+    }
+
+    cv::Rect safe(const cv::Rect& r, const cv::Size& s){
+        return r & cv::Rect(0,0,s.width,s.height);
+    }
+};
