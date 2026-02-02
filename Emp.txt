@@ -1,25 +1,29 @@
-cv::Mat processThermal(const cv::Mat& rgbFrame)
+cv::Mat thermalToWhiteHot(const cv::Mat& rgb)
 {
     static double smoothMin = 0, smoothMax = 255;
-    const double alpha = 0.05;
+    const double alpha = 0.03;
 
     cv::Mat gray;
-    cv::cvtColor(rgbFrame, gray, cv::COLOR_BGR2GRAY);
+    cv::cvtColor(rgb, gray, cv::COLOR_BGR2GRAY);
+    cv::GaussianBlur(gray, gray, cv::Size(3,3), 0);
 
-    double curMin, curMax;
-    cv::minMaxLoc(gray, &curMin, &curMax);
+    cv::Mat flat = gray.reshape(0,1);
+    cv::Mat sorted;
+    cv::sort(flat, sorted, cv::SORT_ASCENDING);
 
-    smoothMin = (1 - alpha) * smoothMin + alpha * curMin;
-    smoothMax = (1 - alpha) * smoothMax + alpha * curMax;
+    int total = sorted.cols;
+    uchar vmin = sorted.at<uchar>(0, total * 0.01);
+    uchar vmax = sorted.at<uchar>(0, total * 0.99);
+
+    smoothMin = (1-alpha)*smoothMin + alpha*vmin;
+    smoothMax = (1-alpha)*smoothMax + alpha*vmax;
 
     cv::Mat norm;
-    gray.convertTo(norm, CV_8U, 255.0/(smoothMax - smoothMin),
+    gray.convertTo(norm, CV_8U,
+                   255.0/(smoothMax - smoothMin),
                    -smoothMin * 255.0/(smoothMax - smoothMin));
 
     cv::bitwise_not(norm, norm);
 
-    cv::Mat colored;
-    cv::applyColorMap(norm, colored, cv::COLORMAP_INFERNO);
-
-    return colored;
+    return norm;
 }
