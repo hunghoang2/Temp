@@ -95,8 +95,40 @@ TrackState TrackingValidator::validate(const cv::Mat& frame, const cv::Rect& bbo
         return TRACK_LOST;
 }
 
+float TrackingValidator::computeThermalContrast(const cv::Mat& frame, const cv::Rect& roi)
+{
+    cv::Scalar meanROI = cv::mean(frame(roi));
 
+    // tạo vùng nền xung quanh ROI
+    int margin = 20;
+    cv::Rect bg(
+        std::max(0, roi.x - margin),
+        std::max(0, roi.y - margin),
+        std::min(frame.cols - roi.x + margin, roi.width + 2 * margin),
+        std::min(frame.rows - roi.y + margin, roi.height + 2 * margin)
+    );
 
+    cv::Mat bgRegion = frame(bg).clone();
 
+    // xoá phần ROI khỏi background
+    cv::rectangle(bgRegion,
+                  cv::Rect(margin, margin, roi.width, roi.height),
+                  0, -1);
+
+    cv::Scalar meanBG = cv::mean(bgRegion);
+
+    return static_cast<float>(meanROI[0] - meanBG[0]);
+}
+
+float TrackingValidator::computeEdgeDensity(const cv::Mat& roi)
+{
+    cv::Mat edges;
+    cv::Canny(roi, edges, 50, 150);
+
+    float edgePixels = static_cast<float>(cv::countNonZero(edges));
+    float totalPixels = static_cast<float>(roi.total());
+
+    return edgePixels / totalPixels;
+}
 
 
