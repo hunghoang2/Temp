@@ -11,5 +11,5 @@ tcpserversink host=0.0.0.0 port=5000
 
 gst-launch-1.0 -v \
 tcpclientsrc host=192.168.1.10 port=5000 ! \
-image/jpeg,framerate=30/1 ! \
-jpegdec ! videoconvert ! autovideosink
+application/x-rtp,encoding-name=H264,payload=96 ! \
+rtph264depay ! avdec_h264 ! videoconvert ! autovideosink
